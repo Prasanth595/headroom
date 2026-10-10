@@ -6308,6 +6308,12 @@ class OpenAIHandlerMixin:
                 async def _buffered_ccr_operation():
                     nonlocal headers
                     headers = await apply_copilot_api_auth(headers, url=url)
+                    headers = apply_openai_api_key_fallback(
+                        headers,
+                        upstream_url=upstream_base_url,
+                        config=self.config,
+                        request_id=request_id,
+                    )
                     response = await self._retry_request(
                         "POST",
                         url,

@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.helpers import apply_openai_api_key_fallback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from headroom.proxy.upstream_trust import ALLOWED_HOSTS_ENV  # noqa: E402
 
 UPSTREAM = "https://api.commandcode.ai/provider/v1"
 BODY = {
@@ -104,6 +105,24 @@ def test_streaming_openai_request_uses_process_api_key_when_client_is_keyless(
     assert lower_headers["authorization"] == "Bearer env-key"
 
 
+def test_buffered_openai_responses_uses_process_api_key_when_client_is_keyless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    app = create_app(_make_config())
+
+    with TestClient(app) as client:
+        captured = _install_retry_capture(client)
+        response = client.post(
+            "/v1/responses",
+            json={"model": "gpt-4o-mini", "input": "hello", "stream": False},
+        )
+
+    assert response.status_code == 200, response.text
+    lower_headers = {key.lower(): value for key, value in captured["headers"].items()}
+    assert lower_headers["authorization"] == "Bearer env-key"
+
+
 @pytest.mark.parametrize(
     ("header_name", "header_value"),
     [("Authorization", "Bearer client-key"), ("api-key", "client-key")],
@@ -142,6 +161,41 @@ def test_openai_api_key_fallback_rejects_untrusted_upstream(
         {"content-type": "application/json"},
         upstream_url="https://attacker.example/v1",
         config=_make_config(),
+    )
+
+    assert "authorization" not in {key.lower() for key in headers}
+
+
+def test_openai_api_key_fallback_is_scoped_to_openai_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    monkeypatch.setenv(ALLOWED_HOSTS_ENV, "api.xai.example")
+    config = ProxyConfig(
+        openai_api_url=UPSTREAM,
+        anthropic_api_url="https://api.xai.example/v1",
+    )
+
+    headers = apply_openai_api_key_fallback(
+        {"content-type": "application/json"},
+        upstream_url="https://api.xai.example/v1",
+        config=config,
+    )
+
+    assert "authorization" not in {key.lower() for key in headers}
+
+
+def test_openai_api_key_fallback_refuses_plaintext_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    http_upstream = "http://api.commandcode.ai/provider/v1"
+    config = ProxyConfig(openai_api_url=http_upstream)
+
+    headers = apply_openai_api_key_fallback(
+        {"content-type": "application/json"},
+        upstream_url=http_upstream,
+        config=config,
     )
 
     assert "authorization" not in {key.lower() for key in headers}

@@ -2101,12 +2101,12 @@ def apply_openai_api_key_fallback(
     config: Any = None,
     request_id: str | None = None,
 ) -> dict[str, str]:
-    """Add the process OpenAI key when an HTTP client supplied no credential.
+    """Add the process OpenAI key only for a configured HTTPS OpenAI upstream.
 
     The WebSocket OpenAI handshake has always used ``OPENAI_API_KEY`` as a
     fallback. Keep the HTTP behavior aligned, but only send the process key to
-    an operator-designated upstream. A request-controlled custom base URL must
-    not be able to redirect that credential to an arbitrary host.
+    the configured OpenAI target. A request-controlled custom base URL must not
+    redirect that credential to another provider or a plaintext HTTP endpoint.
     """
     if any(key.lower() in {"authorization", "api-key"} for key in headers):
         return headers
@@ -2115,10 +2115,9 @@ def apply_openai_api_key_fallback(
     if not api_key:
         return headers
 
-    from headroom.proxy.upstream_trust import is_trusted_upstream, warn_untrusted_once
+    from headroom.proxy.upstream_trust import is_trusted_openai_upstream
 
-    if not is_trusted_upstream(upstream_url, config):
-        warn_untrusted_once(upstream_url, request_id=request_id)
+    if not is_trusted_openai_upstream(upstream_url, config):
         return headers
 
     authenticated = dict(headers)
