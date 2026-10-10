@@ -123,6 +123,31 @@ def test_buffered_openai_responses_uses_process_api_key_when_client_is_keyless(
     assert lower_headers["authorization"] == "Bearer env-key"
 
 
+def test_buffered_grok_responses_does_not_receive_openai_process_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        openai_api_url="https://api.openai.com/v1",
+    )
+    app = create_app(config)
+
+    with TestClient(app) as client:
+        captured = _install_retry_capture(client)
+        response = client.post(
+            "/v1/responses",
+            headers={"x-xai-token-auth": "xai-grok-cli"},
+            json={"model": "gpt-4o-mini", "input": "hello", "stream": False},
+        )
+
+    assert response.status_code == 200, response.text
+    assert captured["url"].startswith("https://api.x.ai/")
+    assert "authorization" not in {key.lower() for key in captured["headers"]}
+
+
 @pytest.mark.parametrize(
     ("header_name", "header_value"),
     [("Authorization", "Bearer client-key"), ("api-key", "client-key")],

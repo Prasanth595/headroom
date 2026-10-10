@@ -6310,7 +6310,7 @@ class OpenAIHandlerMixin:
                     headers = await apply_copilot_api_auth(headers, url=url)
                     headers = apply_openai_api_key_fallback(
                         headers,
-                        upstream_url=upstream_base_url,
+                        upstream_url=url,
                         config=self.config,
                         request_id=request_id,
                     )
