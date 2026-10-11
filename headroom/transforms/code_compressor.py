@@ -840,11 +840,12 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
         re.compile(r"<\?php\b"),
         re.compile(r"^[^\S\n]*namespace\s+[\w\\]+\s*;", re.MULTILINE),
         re.compile(r"^[^\S\n]*use\s+[\w\\]+(\s+as\s+\w+)?\s*;", re.MULTILINE),
-        # Both gaps stop at the newline: with no modifier, the second one
-        # sits right after the anchor, and as ``\s*`` the pair was cubic.
+        # The modifier carries its own trailing gap. As ``^\s*(mod)?\s*``,
+        # two adjacent gaps could split the same run of whitespace every
+        # possible way: cubic on blank runs, quadratic on one long indent.
         re.compile(
-            r"^[^\S\n]*(public|private|protected|static|abstract|final)?"
-            r"[^\S\n]*function\s+\w+\s*\(",
+            r"^[^\S\n]*(?:(public|private|protected|static|abstract|final)[^\S\n]*)?"
+            r"function\s+\w+\s*\(",
             re.MULTILINE,
         ),
         re.compile(r"\$this->|->\w+\s*\(", re.MULTILINE),

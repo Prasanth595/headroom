@@ -32,8 +32,18 @@ _LINE_ANCHORED_PATTERNS = [_JSON_BLOCK_START] + [
 ]
 
 
+_PHP_MODIFIERS = "(public|private|protected|static|abstract|final)"
+_PHP_FUNCTION_PREFIX = rf"^[^\S\n]*(?:{_PHP_MODIFIERS}[^\S\n]*)?function"
+
+
 def _original(pattern: re.Pattern[str]) -> re.Pattern[str]:
-    """The pre-fix pattern: every ``[^\\S\\n]*`` was ``\\s*``."""
+    """The pre-fix pattern: every ``[^\\S\\n]*`` was ``\\s*``.
+
+    The PHP ``function`` pattern was also regrouped (the modifier now carries
+    its own trailing gap), so its pre-fix form is spelled out.
+    """
+    if pattern.pattern.startswith(_PHP_FUNCTION_PREFIX):
+        return re.compile(rf"^\s*{_PHP_MODIFIERS}?\s*function\s+\w+\s*\(", pattern.flags)
     return re.compile(pattern.pattern.replace(r"[^\S\n]*", r"\s*"), pattern.flags)
 
 
@@ -80,6 +90,21 @@ def test_each_line_anchored_pattern_is_linear_on_blank_runs(pattern: re.Pattern[
     assert elapsed < 0.01, f"{elapsed * 1000:.1f}ms on a 5,000-line blank run"
 
 
+@pytest.mark.parametrize("pattern", _LINE_ANCHORED_PATTERNS, ids=lambda p: p.pattern)
+def test_each_line_anchored_pattern_is_linear_on_one_long_indent(
+    pattern: re.Pattern[str],
+) -> None:
+    """Two adjacent gaps can split one run of spaces every possible way.
+
+    Narrowing both PHP gaps to ``[^\\S\\n]*`` still left them adjacent when the
+    modifier is absent, so a single 5,000-space line cost 90-190ms (20-100ms
+    with the original ``\\s*``). The modifier now carries its own trailing gap.
+    """
+    indent = " " * 5_000 + "x"
+    elapsed = _fastest_run(lambda: pattern.findall(indent), budget=0.01)
+    assert elapsed < 0.01, f"{elapsed * 1000:.1f}ms on a 5,000-space line"
+
+
 _FUZZ_TOKENS = [
     "\n",
     "\n\n",
@@ -117,6 +142,10 @@ _FUZZ_TOKENS = [
     "use A\\B;",
     "public function f(",
     "function g(",
+    "publicfunction h(",
+    "static ",
+    "final",
+    "abstract\n",
     "#!/bin/bash",
     "if",
     "done",
@@ -126,6 +155,7 @@ _FUZZ_TOKENS = [
 
 def test_match_counts_are_unchanged() -> None:
     """``detect_language`` scores by match count; it must not move."""
+    assert any(p.pattern.startswith(_PHP_FUNCTION_PREFIX) for p in _LINE_ANCHORED_PATTERNS)
     rng = random.Random(0)
     for _ in range(3_000):
         text = "".join(rng.choice(_FUZZ_TOKENS) for _ in range(rng.randint(1, 14)))
