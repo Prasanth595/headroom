@@ -523,6 +523,54 @@ def test_openai_responses_unit_cache_reuses_result_with_missing_inherited_marker
         clear_request_compression_store()
 
 
+@pytest.mark.parametrize("same_hash", [True, False])
+@pytest.mark.parametrize("marker_format", ["<<ccr:{hash}>>", "[Retrieve more: hash={hash}]"])
+def test_openai_responses_unit_cache_renews_generated_hash_with_inherited_marker(
+    same_hash, marker_format
+):
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        set_request_compression_store,
+    )
+
+    store = CompressionStore(max_entries=100, default_ttl=60)
+    set_request_compression_store(store)
+    try:
+        handler, calls = _marker_compressing_handler(store)
+        text = " ".join(f"word{i}" for i in range(180))
+        seeded = _compress_shell_output(handler, text, "req_seed")
+        generated_hash = seeded.rsplit("hash=", 1)[1].rstrip("]")
+        inherited_hash = generated_hash if same_hash else store.store("other original", "other")
+        marker = marker_format.format(hash=inherited_hash)
+        # Both marker-free spans generate the same hash; neither may be hidden
+        # by the preserved inherited marker or the last router result.
+        mixed = f"{text}\n{marker}\n{text}"
+        first = _compress_shell_output(handler, mixed, "req_mixed_one")
+        assert first == f"{seeded}\n{marker}\n{seeded}"
+        assert calls["count"] == 3
+        assert _compress_shell_output(handler, mixed, "req_mixed_cached") == first
+        assert calls["count"] == 3
+
+        entry = store.retrieve(generated_hash)
+        assert entry is not None
+        assert entry.original_content == text
+        entry.created_at -= entry.ttl + 1
+        store._backend.set(generated_hash, entry)
+        assert store.retrieve(generated_hash) is None
+        if not same_hash:
+            assert store.exists(inherited_hash)
+
+        second = _compress_shell_output(handler, mixed, "req_mixed_expired")
+        assert calls["count"] == 5
+        assert second == first
+        renewed = store.retrieve(generated_hash)
+        assert renewed is not None
+        assert renewed.original_content == text
+    finally:
+        clear_request_compression_store()
+
+
 def test_openai_responses_unit_cache_recompresses_when_ccr_entry_expired():
     # The unit cache has no TTL; the CCR entry behind its marker does. Reusing the
     # cached result after the entry expired would ship a marker no retrieval can

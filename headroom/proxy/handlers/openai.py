@@ -18,7 +18,7 @@ import ssl
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
@@ -724,12 +724,11 @@ def _openai_responses_cached_ccr_markers_live(result: Any) -> bool:
     compressed = getattr(result, "compressed", None)
     if not isinstance(compressed, str):
         return True
-    hashes = {match.group(1).lower() for match in _CCR_HASH_RE.finditer(compressed)}
+    hashes = Counter(match.group(1).lower() for match in _CCR_HASH_RE.finditer(compressed))
     original = getattr(result, "original", "")
     if isinstance(original, str):
-        hashes.difference_update(
-            match.group(1).lower() for match in _CCR_HASH_RE.finditer(original)
-        )
+        # Inherited markers are preserved byte-for-byte; extra occurrences are generated.
+        hashes -= Counter(match.group(1).lower() for match in _CCR_HASH_RE.finditer(original))
     if not hashes:
         return True
     try:
