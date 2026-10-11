@@ -497,6 +497,32 @@ def _compress_shell_output(handler, text: str, request_id: str):
     return new_payload["input"][0]["output"]
 
 
+@pytest.mark.parametrize(
+    "marker",
+    ["<<ccr:deadbeefdead>>", "[Retrieve more: hash=deadbeefdead]"],
+)
+def test_openai_responses_unit_cache_reuses_result_with_missing_inherited_marker(marker):
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        set_request_compression_store,
+    )
+
+    store = CompressionStore(max_entries=100, default_ttl=60)
+    set_request_compression_store(store)
+    try:
+        handler, calls = _marker_compressing_handler(store)
+        text = " ".join(f"word{i}" for i in range(180)) + "\n" + marker
+        outputs = [_compress_shell_output(handler, text, f"req_inherited_{i}") for i in range(3)]
+
+        assert outputs[0] == outputs[1] == outputs[2]
+        assert marker in outputs[0]
+        assert not store.exists("deadbeefdead")
+        assert calls["count"] == 1
+    finally:
+        clear_request_compression_store()
+
+
 def test_openai_responses_unit_cache_recompresses_when_ccr_entry_expired():
     # The unit cache has no TTL; the CCR entry behind its marker does. Reusing the
     # cached result after the entry expired would ship a marker no retrieval can

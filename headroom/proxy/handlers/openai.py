@@ -713,19 +713,23 @@ def _openai_responses_result_with_cache_hit(result: Any) -> Any:
 
 
 def _openai_responses_cached_ccr_markers_live(result: Any) -> bool:
-    """Return whether every CCR marker in a cached unit result is still retrievable.
+    """Return whether CCR markers generated for a cached unit are still retrievable.
 
     The unit-result cache outlives CCR entries: it has no TTL, while a CCR entry
     expires after the CCR TTL and is written only when the unit is compressed.
-    Reusing a cached result after its entry expired ships a marker the model can
-    never redeem. Such a result is treated as a miss, so the unit is compressed
-    again and its entry stored again. A store that cannot be consulted keeps the
-    previous behaviour (reuse).
+    Treat an expired generated entry as a miss so compression stores it again.
+    Inherited markers cannot be restored by recompressing the unit. A store that
+    cannot be consulted keeps the previous behaviour (reuse).
     """
     compressed = getattr(result, "compressed", None)
     if not isinstance(compressed, str):
         return True
     hashes = {match.group(1).lower() for match in _CCR_HASH_RE.finditer(compressed)}
+    original = getattr(result, "original", "")
+    if isinstance(original, str):
+        hashes.difference_update(
+            match.group(1).lower() for match in _CCR_HASH_RE.finditer(original)
+        )
     if not hashes:
         return True
     try:
