@@ -68,6 +68,9 @@ Its schema v7 records `pricing_basis="cache-region-v1"` on compression
 aggregates and history points. This identifies the pricing **method**;
 `savings_basis` still describes estimate quality, such as catalog or list-price
 fallback, and is not a method version.
+Legacy quality labels do not determine the new priced total's confidence.
+New catalog estimates start independently; a later qualified list-price
+contribution lowers the combined estimate quality.
 
 Earlier files did not persist the per-request cache mix needed to distinguish
 flat-list history from later cache-aware or mixed totals. On upgrade, those

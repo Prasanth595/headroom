@@ -223,3 +223,36 @@ def test_compression_checkpoints_preserve_priced_buckets_and_audit_on_reload(
     assert [float(row["compression_savings_usd_delta"]) for row in rows[-2:]] == expected
     assert float(rows[-2]["legacy_compression_savings_usd"]) == legacy_compression
     assert float(rows[-2]["legacy_tool_schema_savings_usd"]) == legacy_tool
+
+
+def test_current_estimate_quality_ignores_legacy_and_weakens_on_list_fallback(tmp_path):
+    state = _legacy_state()
+    state["schema_version"] = 6
+    state["lifetime"].update(
+        compression_savings_list_usd=100.0,
+        savings_basis=BASIS_LIST,
+    )
+    path = tmp_path / "savings.json"
+    path.write_text(json.dumps(state), encoding="utf-8", newline="\n")
+    tracker = SavingsTracker(path=str(path))
+    tracker.record_request(
+        model="sample-model",
+        input_tokens=1000,
+        tokens_saved=100,
+        estimated_savings_usd={"compression": 0.01, "basis": BASIS_CATALOG},
+    )
+    restarted = SavingsTracker(path=str(path))
+    first = restarted.snapshot()["lifetime"]
+    assert first["compression_savings_usd"] == pytest.approx(0.01)
+    assert first["savings_basis"] == BASIS_CATALOG
+
+    restarted.record_request(
+        model="sample-model",
+        input_tokens=1000,
+        tokens_saved=100,
+        estimated_savings_usd={"compression": 0.02, "basis": BASIS_LIST},
+    )
+    final = SavingsTracker(path=str(path)).snapshot()["lifetime"]
+    assert final["compression_savings_usd"] == pytest.approx(0.03)
+    assert final["legacy_compression_savings_usd"] == 100.0
+    assert final["savings_basis"] == BASIS_LIST

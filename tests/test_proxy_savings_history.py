@@ -135,6 +135,9 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     )
 
     persisted = json.loads(path.read_text(encoding="utf-8"))
+    first_time = datetime.fromisoformat(persisted["history"][0]["timestamp"].replace("Z", "+00:00"))
+    assert first_time == local_time
+    assert first_time.utcoffset() == timedelta(0)
     assert persisted["lifetime"]["tokens_saved"] == 15
     assert persisted["lifetime"]["total_input_tokens"] == 180
     assert persisted["lifetime"]["total_input_cost_usd"] == pytest.approx(0.36)
