@@ -2061,3 +2061,81 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
         f"{captured_b['frozen_message_count']}. The optimization path must "
         f"be identical for both."
     )
+
+
+def test_ccr_alias_instructions_are_executable_at_anthropic_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import re
+
+    from headroom.cache import compression_store
+
+    captured: dict = {}
+    with _make_proxy_client() as client:
+        store = compression_store.CompressionStore(enable_feedback=False)
+        hash_key = store.store(original="Original alias API context.", compressed="compressed")
+        monkeypatch.setattr(compression_store, "_compression_store", store)
+        proxy = client.app.state.proxy
+        proxy.config.image_optimize = False
+        proxy.config.ccr_inject_tool = True
+        proxy.config.ccr_inject_system_instructions = True
+        alias = "headroom_headroom_retrieve"
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured.update(body)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_alias_instructions",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Context available."}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 20, "output_tokens": 3},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "tools": [{"name": alias, "input_schema": {"type": "object"}}],
+                "messages": [
+                    {"role": "user", "content": "Retrieve original context."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "alias_call",
+                                "name": alias,
+                                "input": {"hash": hash_key},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "alias_call",
+                                "content": f"<<ccr:{hash_key} 1_rows_offloaded>>",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+        assert response.status_code == 200, response.text
+
+    system = captured["system"]
+    instructions = system if isinstance(system, str) else "\n".join(b["text"] for b in system)
+    invoked_names = re.findall(r"`([^`]+)\(hash=", instructions)
+    registered_names = {tool["name"] for tool in captured["tools"]}
+    assert invoked_names == [alias]
+    assert set(invoked_names) <= registered_names
+    assert registered_names == {alias}
+    assert hash_key in instructions
