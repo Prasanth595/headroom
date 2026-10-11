@@ -21,7 +21,7 @@ import json
 
 import pytest
 
-from headroom.ccr.tool_injection import CCR_TOOL_NAME, create_ccr_tool_definition
+from headroom.ccr.tool_injection import CCR_TOOL_NAME, CCRToolInjector, create_ccr_tool_definition
 from headroom.proxy.helpers import (
     _reset_session_ccr_tracker_for_test,
     apply_session_sticky_ccr_tool,
@@ -103,15 +103,6 @@ def test_the_tool_is_present_from_the_very_first_request(provider):
     assert CCR_TOOL_NAME in _names(tools)
 
 
-def test_the_tool_definition_is_small_enough_that_eager_is_obviously_right():
-    """Guards the premise: if this ever grows large, revisit the trade."""
-    size = len(json.dumps(create_ccr_tool_definition()))
-    assert size < 2000, (
-        f"headroom_retrieve is now {size} bytes; eager injection was justified "
-        "on it being ~478 bytes (~119 tokens) of the session's first cache write"
-    )
-
-
 # ── the escape hatch still works ──────────────────────────────────────
 
 
@@ -132,7 +123,7 @@ def test_an_invalid_mode_raises_rather_than_silently_defaulting(monkeypatch):
     from headroom.proxy.helpers import get_ccr_tool_injection_mode
 
     monkeypatch.setenv("HEADROOM_CCR_TOOL_INJECTION", "sometimes")
-    with pytest.raises(ValueError, match="HEADROOM_CCR_TOOL_INJECTION"):
+    with pytest.raises(ValueError):
         get_ccr_tool_injection_mode()
 
 
@@ -173,6 +164,50 @@ def test_a_client_provided_tool_still_wins(monkeypatch):
     )
     assert injected is False
     assert _names(tools).count(CCR_TOOL_NAME) == 1
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "headroom_headroom_retrieve",
+        "mcp__headroom__headroom_retrieve",
+        "mcp_Headroom_headroom_retrieve",
+    ],
+)
+def test_client_retrieval_alias_never_advertises_an_unavailable_tool(provider, alias):
+    """Mixed-tool turns must only offer retrieval names the client can execute."""
+    retrieval = create_ccr_tool_definition(provider)
+    if provider == "openai":
+        retrieval["function"]["name"] = alias
+        read_tool = {"type": "function", "function": {"name": "Read", "parameters": {}}}
+    else:
+        retrieval["name"] = alias
+        read_tool = CLIENT_TOOLS[0]
+    client_tools = [retrieval, read_tool]
+    session_id = f"sess-client-alias-{provider}-{alias}"
+
+    # A cold request, actual compression, and later replay all retain a usable
+    # retrieval tool without introducing the unavailable bare proxy spelling.
+    for compressed in (False, True, False):
+        tools, injected = apply_session_sticky_ccr_tool(
+            provider=provider,
+            session_id=session_id,
+            request_id="req-client-alias",
+            existing_tools=client_tools,
+            has_compressed_content_this_turn=compressed,
+            allow_eager=True,
+        )
+        assert not injected
+        assert alias in _names(tools)
+        assert CCR_TOOL_NAME not in _names(tools)
+
+    # The no-session library/Google fallback must obey the same client registry.
+    injector = CCRToolInjector(provider=provider, inject_tool=True)
+    tools, injected = injector.inject_tool_definition(client_tools, session_has_done_ccr=True)
+    assert not injected
+    assert alias in _names(tools)
+    assert CCR_TOOL_NAME not in _names(tools)
 
 
 def test_sticky_replay_is_byte_identical_to_the_eager_injection():

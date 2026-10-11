@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from headroom.config import is_tool_excluded
+
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
@@ -456,10 +458,10 @@ class CCRToolInjector:
 
         tools = tools or []
 
-        # Check if already present (e.g., from MCP server)
+        # Respect the same client/MCP aliases as the session-aware proxy path.
         for tool in tools:
             tool_name = tool.get("name") or tool.get("function", {}).get("name")
-            if tool_name == CCR_TOOL_NAME:
+            if is_tool_excluded(tool_name, (CCR_TOOL_NAME,)):
                 return tools, False  # Already present, skip injection
 
         # Add CCR tool

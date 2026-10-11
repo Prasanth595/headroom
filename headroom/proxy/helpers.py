@@ -30,6 +30,7 @@ from urllib.parse import urlsplit, urlunsplit
 from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 from headroom.cache.compression_cache import _is_tool_result_message
+from headroom.config import is_tool_excluded
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -2804,9 +2805,8 @@ def apply_session_sticky_ccr_tool(
       * Otherwise, inject only when this turn produced compressed content.
         The first injection records the golden bytes for future turns.
 
-    Tools whose name already equals ``CCR_TOOL_NAME`` (e.g. the client
-    pre-registered it via MCP) are not re-appended; the client's bytes
-    win.
+    Tools registered under ``CCR_TOOL_NAME`` or a supported client/MCP alias
+    are not re-appended; the client's executable name and definition win.
 
     Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
     fresh list (caller-safe).
@@ -2823,8 +2823,8 @@ def apply_session_sticky_ccr_tool(
         if n:
             existing_names.add(n)
 
-    # Client (or MCP) already provided a tool by this name — don't double up.
-    if CCR_TOOL_NAME in existing_names:
+    # Preserve the client registry on mixed-tool turns; it may only know an alias.
+    if any(is_tool_excluded(name, (CCR_TOOL_NAME,)) for name in existing_names):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
