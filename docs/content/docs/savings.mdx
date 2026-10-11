@@ -77,6 +77,10 @@ excluded from the priced headline in lifetime, session, model, project, and
 history views. Requests, tokens, spend, and retained history are not reset.
 The same exclusion applies to the durable `/stats-lifetime` cost aggregate.
 New qualified prices accumulate separately and remain separate after restart.
+Both `record_request` and `record_compression_savings` history checkpoints retain
+the pricing method and legacy audit amounts, including signed legacy balances.
+Restarting the proxy does not reclassify those new estimates or move them into
+a later hourly bucket.
 
 History and rollup JSON/CSV exports retain the legacy audit amounts.
 Legacy tool-schema values may overlap the legacy compression total: older

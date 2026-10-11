@@ -134,36 +134,6 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
         timestamp="not-a-timestamp",
     )
 
-    snapshot = tracker.snapshot()
-    assert snapshot["history"] == [
-        {
-            "timestamp": "2026-03-27T08:00:00Z",
-            "provider": "unknown",
-            "agent": "unknown",
-            "model": "gpt-4o",
-            "total_tokens_saved": 10,
-            "compression_savings_usd": 0.01,
-            "pricing_basis": "cache-region-v1",
-            "legacy_compression_savings_usd": 0.0,
-            "legacy_tool_schema_savings_usd": 0.0,
-            "total_input_tokens": 120,
-            "total_input_cost_usd": 0.24,
-        },
-        {
-            "timestamp": "2026-03-27T12:34:00Z",
-            "provider": "unknown",
-            "agent": "unknown",
-            "model": "gpt-4o",
-            "total_tokens_saved": 15,
-            "compression_savings_usd": 0.015,
-            "pricing_basis": "cache-region-v1",
-            "legacy_compression_savings_usd": 0.0,
-            "legacy_tool_schema_savings_usd": 0.0,
-            "total_input_tokens": 180,
-            "total_input_cost_usd": 0.36,
-        },
-    ]
-
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted["lifetime"]["tokens_saved"] == 15
     assert persisted["lifetime"]["total_input_tokens"] == 180

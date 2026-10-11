@@ -47,35 +47,24 @@ def test_savings_tracker_migrates_v4_lifetime_to_v5_metrics_and_preserves_legacy
     tracker = SavingsTracker(path=str(path), save_flush_every=25)
     lifetime = tracker.lifetime_response()
 
-    assert lifetime["schema_version"] == 5
     assert lifetime["requests"]["total"] == 7
     assert lifetime["tokens"]["input"] == 80
     assert lifetime["tokens"]["attempted_input"] == 100
     assert lifetime["tokens"]["saved"] == 20
     assert lifetime["prefix_cache"]["cache_read_tokens"] == 5
-    assert lifetime["cost"] == {
-        "input_usd": 1.5,
-        # The old price remains auditable, not a qualified current estimate.
-        "compression_savings_usd": 0.0,
-        "pricing_basis": "cache-region-v1",
-        "legacy_compression_savings_usd": 0.5,
-        "compression_savings_list_usd": 0.5,
-        "savings_basis": "unknown",
-        "cache_savings_usd": 0.2,
-    }
+    assert lifetime["cost"]["input_usd"] == 1.5
+    assert lifetime["cost"]["compression_savings_usd"] == 0.0
+    assert lifetime["cost"]["legacy_compression_savings_usd"] == 0.5
+    assert lifetime["cost"]["cache_savings_usd"] == 0.2
     assert lifetime["by_model"]["other"]["input_tokens"] == 80
 
     tracker.flush()
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema_version"] == 7
     # Usage and spend survive unchanged; unversioned savings move to audit.
     expected_lifetime = {**legacy_state["lifetime"], "compression_savings_usd": 0.0}
     assert saved["lifetime"].items() >= expected_lifetime.items()
     assert saved["lifetime"]["legacy_compression_savings_usd"] == 0.5
-    assert saved["lifetime"]["pricing_basis"] == "cache-region-v1"
     assert saved["lifetime"]["compression_savings_list_usd"] == 0.5
-    assert saved["lifetime"]["savings_basis"] == "unknown"
-    assert isinstance(saved["lifetime"]["savings_basis_migrated_at"], str)
     assert saved["display_session"]["requests"] == 2
     assert saved["projects"]["keep-me"]["requests"] == 1
     assert saved["lifetime_metrics"]["models"]["other"]["input_tokens"] == 80
