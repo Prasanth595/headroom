@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import type { Plugin as PluginV2 } from "@opencode/plugin";
 import { z } from "zod";
 
 import {
@@ -23,6 +24,12 @@ import {
   TOOL_POLICY_TOKEN_ENV,
   TOOL_POLICY_URL_ENV,
   TOOL_POLICY_VALID_UNTIL_ENV,
+  BASE_URL_HEADER,
+  ORIGINAL_PATH_HEADER,
+  PROJECT_HEADER,
+  SESSION_TOKEN_HEADER,
+  modelBaseRoutesThroughProxy,
+  normalizeExcludeHosts,
 } from "./transport.js";
 
 export interface HeadroomOpenCodePluginOptions {
@@ -35,6 +42,7 @@ export interface HeadroomOpenCodePluginOptions {
   pendingPreflightTtlMs?: number;
   maxPendingPreflights?: number;
   maxRetiredCallIdentities?: number;
+  sessionToken?: string;
 }
 
 const DEFAULT_PENDING_PREFLIGHT_TTL_MS = 5 * 60 * 1_000;
@@ -50,6 +58,8 @@ interface PendingPreflight {
 function positiveInteger(value: number | undefined, fallback: number): number {
   return Number.isSafeInteger(value) && value! > 0 ? value! : fallback;
 }
+
+export const HEADROOM_PLUGIN_ID = "headroom";
 
 function normalizeProxyUrl(url: string): string {
   return trimTrailingSlashes(url);
@@ -68,6 +78,108 @@ function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
   );
 }
 
+// Read by workspace_registry.resolve_registered_cwd() on the proxy side --
+// mirrors wrap.py's _apply_session_token_header_env for claude.
+function resolveSessionToken(options?: HeadroomOpenCodePluginOptions): string | undefined {
+  return options?.sessionToken ?? process.env.HEADROOM_OPENCODE_SESSION_TOKEN;
+}
+
+
+// The exclusion list governs both the transport patch and the 2.x model
+// rewrite, so resolve it once: option over environment variable, normalized
+// the same way the transport does.
+function resolveExcludeHosts(options?: HeadroomOpenCodePluginOptions): string[] {
+  return normalizeExcludeHosts(options?.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
+}
+
+function headroomShellEnv(
+  proxyUrl: string,
+  project: string,
+  options: HeadroomOpenCodePluginOptions,
+): Record<string, string> {
+  return {
+    HEADROOM_ACTIVE: "1",
+    HEADROOM_PROXY_URL: proxyUrl,
+    HEADROOM_PROJECT: project,
+    ...(options.backend ? { HEADROOM_BACKEND: options.backend } : {}),
+  };
+}
+
+function applyHeadroomShellEnv(
+  env: Record<string, string | undefined>,
+  proxyUrl: string,
+  project: string,
+  options: HeadroomOpenCodePluginOptions,
+): void {
+  delete env[TOOL_POLICY_TOKEN_ENV];
+  delete env[TOOL_POLICY_URL_ENV];
+  Object.assign(env, headroomShellEnv(proxyUrl, project, options));
+  for (const name of [
+    EXCLUDE_HOSTS_ENV,
+    TOOL_POLICY_ENV,
+    TOOL_POLICY_PATH_ENV,
+    TOOL_POLICY_REFRESH_SECONDS_ENV,
+    TOOL_POLICY_VALID_UNTIL_ENV,
+  ]) {
+    if (process.env[name]) {
+      env[name] = process.env[name];
+    } else {
+      delete env[name];
+    }
+  }
+}
+
+// The endpoint an OpenCode 2.x package calls under its baseURL, for packages
+// on the OpenAI chat-completions or responses wire format; undefined otherwise.
+// `.../messages` (Anthropic wire) and other protocols are left alone.
+function openAiWireSuffix(pkg: string | undefined): string | undefined {
+  if (!pkg?.startsWith("@opencode/ai/providers/")) return undefined;
+  if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
+    return "/chat/completions";
+  }
+  if (pkg.endsWith("-responses") || pkg.endsWith("/responses")) return "/responses";
+  return undefined;
+}
+
+// OpenCode 2.x sends model traffic through Effect's FetchHttpClient, which
+// captures `globalThis.fetch` on the process's first HTTP request, before any
+// plugin runs, so the transport's fetch patch never sees it. Point each
+// remote OpenAI-wire model at the proxy instead, with the same routing headers
+// the transport sends: the upstream origin, and the real path the proxy
+// appends to it.
+type ModelEditor = Parameters<Parameters<PluginV2.Context["model"]["transform"]>[0]>[0];
+
+function routeModelsThroughProxy(
+  models: ModelEditor,
+  proxyUrl: string,
+  project: string,
+  excludeHosts: string[],
+  sessionToken?: string,
+): void {
+  for (const model of models.list()) {
+    // DeepMutable turns the branded ID strings into object types.
+    const providerID = String(model.providerID);
+    const modelID = String(model.id);
+    const provider = models.provider.get(providerID)?.provider;
+    const suffix = openAiWireSuffix(model.package ?? provider?.package);
+    const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
+    if (!suffix || typeof baseURL !== "string") continue;
+    if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;
+    const upstream = new URL(baseURL);
+    models.update(providerID, modelID, (draft) => {
+      draft.settings = { ...draft.settings, baseURL: `${proxyUrl}/v1` };
+      draft.headers = {
+        ...draft.headers,
+        [BASE_URL_HEADER]: upstream.origin,
+        [ORIGINAL_PATH_HEADER]: `${trimTrailingSlashes(upstream.pathname)}${suffix}`,
+        [PROJECT_HEADER]: project,
+        ...(sessionToken ? { [SESSION_TOKEN_HEADER]: sessionToken } : {}),
+      };
+    });
+  }
+}
+
+// OpenCode 1.x: a factory returning a hooks object.
 export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   const pluginOptions = options as HeadroomOpenCodePluginOptions;
   const proxyUrl = resolveProxyUrl(pluginOptions);
@@ -84,6 +196,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
     excludeHosts: pluginOptions.excludeHosts,
     debug: pluginOptions.debug,
     toolPolicy: pluginOptions.toolPolicy,
+    sessionToken: resolveSessionToken(pluginOptions),
   });
   await refreshHeadroomToolPolicy();
   const pendingPreflights = new Map<string, PendingPreflight>();
@@ -183,33 +296,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
       }),
     },
     "shell.env": async (_input, output) => {
-      delete output.env[TOOL_POLICY_TOKEN_ENV];
-      delete output.env[TOOL_POLICY_URL_ENV];
-      output.env.HEADROOM_ACTIVE = "1";
-      output.env.HEADROOM_PROXY_URL = proxyUrl;
-      output.env.HEADROOM_PROJECT = project;
-      if (process.env[EXCLUDE_HOSTS_ENV]) {
-        output.env[EXCLUDE_HOSTS_ENV] = process.env[EXCLUDE_HOSTS_ENV];
-      } else {
-        delete output.env[EXCLUDE_HOSTS_ENV];
-      }
-      if (pluginOptions.backend) {
-        output.env.HEADROOM_BACKEND = pluginOptions.backend;
-      }
-      if (process.env[TOOL_POLICY_ENV]) {
-        output.env[TOOL_POLICY_ENV] = process.env[TOOL_POLICY_ENV];
-      }
-      if (process.env[TOOL_POLICY_PATH_ENV]) {
-        output.env[TOOL_POLICY_PATH_ENV] = process.env[TOOL_POLICY_PATH_ENV];
-      }
-      for (const name of [
-        TOOL_POLICY_REFRESH_SECONDS_ENV,
-        TOOL_POLICY_VALID_UNTIL_ENV,
-      ]) {
-        if (process.env[name]) {
-          output.env[name] = process.env[name];
-        }
-      }
+      applyHeadroomShellEnv(output.env, proxyUrl, project, pluginOptions);
     },
     "tool.execute.before": async (hookInput, output) => {
       const preflight = await enforceNativeToolExecution(
@@ -260,4 +347,64 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   };
 };
 
-export default HeadroomPlugin;
+// OpenCode 2.x: setup registers hooks imperatively and returns its cleanup.
+// OpenCode reruns setup (after cleanup) whenever it hot-reloads the plugin;
+// the transport is refcounted, so reinstalling is safe.
+export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
+  const pluginOptions = ctx.options as HeadroomOpenCodePluginOptions;
+  const proxyUrl = resolveProxyUrl(pluginOptions);
+  const project =
+    pluginOptions.project ?? ctx.location.project.id ?? ctx.location.directory;
+  const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
+  const excludeHosts = resolveExcludeHosts(pluginOptions);
+  const sessionToken = resolveSessionToken(pluginOptions);
+  const uninstallTransport = installHeadroomTransport({
+    proxyUrl,
+    project,
+    policyProject: ctx.location.directory,
+    excludeHosts,
+    debug: pluginOptions.debug,
+    toolPolicy: pluginOptions.toolPolicy,
+    sessionToken,
+  });
+
+  try {
+    await refreshHeadroomToolPolicy();
+    await ctx.model.transform((models) => {
+      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
+    });
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: retrieveTool.name,
+        description: retrieveTool.description,
+        input: retrieveTool.parameters,
+        // Offer the tool directly, like OpenCode's built-ins, rather than only
+        // through the code-mode `execute` tool.
+        options: { codemode: false },
+        async execute(args) {
+          return { content: await retrieveTool.execute(args as { hash: string }) };
+        },
+      });
+    });
+    await ctx.shell.hook("create.before", (shell) => {
+      applyHeadroomShellEnv(shell.env, proxyUrl, project, pluginOptions);
+    });
+  } catch (error) {
+    uninstallTransport();
+    throw error;
+  }
+
+  return () => {
+    uninstallTransport();
+  };
+};
+
+// One default export for both loaders: OpenCode 1.x reads `server`, 2.x reads
+// `setup`, and each ignores the other's key.
+export const HeadroomOpenCodePlugin = {
+  id: HEADROOM_PLUGIN_ID,
+  server: HeadroomPlugin,
+  setup: headroomSetup,
+};
+
+export default HeadroomOpenCodePlugin;

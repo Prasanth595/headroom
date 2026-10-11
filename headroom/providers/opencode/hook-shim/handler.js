@@ -13,6 +13,7 @@ var fs = nodeRequire("node:fs");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 var PROJECT_HEADER = "x-headroom-project";
+var SESSION_TOKEN_HEADER = "x-headroom-session-token";
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 var TOOL_POLICY_ENV = "HEADROOM_TOOL_POLICY_JSON";
@@ -1208,7 +1209,7 @@ function isExcludedHost(hostname, excludeHosts) {
 function isLlmEndpointPath(pathname) {
   return pathname.endsWith("/chat/completions") || pathname.endsWith("/responses") || pathname.endsWith("/messages") || pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent");
 }
-function shouldRoute(url, proxy, excludeHosts) {
+function isRoutableUpstream(url, proxy, excludeHosts) {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return false;
   }
@@ -1221,7 +1222,10 @@ function shouldRoute(url, proxy, excludeHosts) {
   if (isExcludedHost(url.hostname, excludeHosts)) {
     return false;
   }
-  return isLlmEndpointPath(url.pathname);
+  return true;
+}
+function shouldRoute(url, proxy, excludeHosts) {
+  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
 }
 function routedUrl(upstream, proxy) {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
@@ -1257,7 +1261,7 @@ function requestUrl(input) {
   }
   return new URL(String(input));
 }
-function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project = void 0) {
+function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project = void 0, sessionToken = void 0) {
   const headers = new Headers(input instanceof Request ? input.headers : void 0);
   if (init?.headers) {
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
@@ -1272,9 +1276,12 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project
   if (project) {
     headers.set(PROJECT_HEADER, project);
   }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
+  }
   return headers;
 }
-function withRoutedFetchInput(input, init, proxy, project, excludeHosts) {
+function withRoutedFetchInput(input, init, proxy, project, excludeHosts, sessionToken) {
   const upstream = requestUrl(input);
   if (!shouldRoute(upstream, proxy, excludeHosts)) {
     return [input, init];
@@ -1282,7 +1289,7 @@ function withRoutedFetchInput(input, init, proxy, project, excludeHosts) {
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath, project)
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project, sessionToken)
   };
   if (input instanceof Request) {
     return [new Request(nextUrl, input), nextInit];
@@ -1328,7 +1335,7 @@ function urlFromRequestOptions(options) {
     return void 0;
   }
 }
-function headersForNodeRequest(options, upstream, originalPath, project) {
+function headersForNodeRequest(options, upstream, originalPath, project, sessionToken) {
   const headers = new Headers(options.headers);
   headers.set(BASE_URL_HEADER, upstream.origin);
   if (originalPath) {
@@ -1337,6 +1344,9 @@ function headersForNodeRequest(options, upstream, originalPath, project) {
   if (project) {
     headers.set(PROJECT_HEADER, project);
   }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
+  }
   headers.delete("host");
   const result = {};
   headers.forEach((value, key) => {
@@ -1344,7 +1354,7 @@ function headersForNodeRequest(options, upstream, originalPath, project) {
   });
   return result;
 }
-function routedNodeOptions(parts, proxy, project, excludeHosts) {
+function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken) {
   if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
     return void 0;
   }
@@ -1375,7 +1385,7 @@ function routedNodeOptions(parts, proxy, project, excludeHosts) {
     hostname: nextUrl.hostname,
     port: nextUrl.port || void 0,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project)
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project, sessionToken)
   };
 }
 function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest) {
@@ -1393,7 +1403,13 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
         url: parts.url
       });
     }
-    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts);
+    const nextOptions = routedNodeOptions(
+      parts,
+      proxy,
+      state.project,
+      state.excludeHosts,
+      state.sessionToken
+    );
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -1465,6 +1481,7 @@ function installHeadroomTransport(options) {
     existing.project = options.project;
     existing.excludeHosts = excludeHosts;
     existing.debug = Boolean(options.debug);
+    existing.sessionToken = options.sessionToken;
     installProcessEnv(options.proxyUrl, excludeHosts, existing.toolPolicy);
     return () => uninstallHeadroomTransport();
   }
@@ -1485,6 +1502,7 @@ function installHeadroomTransport(options) {
     previousExcludeHostsEnv: process.env[EXCLUDE_HOSTS_ENV],
     previousToolPolicyEnv: process.env[TOOL_POLICY_ENV],
     previousToolPolicyValidUntilEnv: process.env[TOOL_POLICY_VALID_UNTIL_ENV],
+    sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
     originalHttpGet: http.get,
@@ -1516,7 +1534,8 @@ function installHeadroomTransport(options) {
       args[1],
       proxy,
       current.project,
-      current.excludeHosts
+      current.excludeHosts,
+      current.sessionToken
     );
     return state.originalFetch(nextInput, nextInit);
   };

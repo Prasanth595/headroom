@@ -11,9 +11,10 @@ const http2 = nodeRequire("node:http2") as typeof import("node:http2");
 const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
 const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
-const BASE_URL_HEADER = "x-headroom-base-url";
-const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
-const PROJECT_HEADER = "x-headroom-project";
+export const BASE_URL_HEADER = "x-headroom-base-url";
+export const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+export const PROJECT_HEADER = "x-headroom-project";
+export const SESSION_TOKEN_HEADER = "x-headroom-session-token";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 export const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 export const TOOL_POLICY_ENV = "HEADROOM_TOOL_POLICY_JSON";
@@ -74,6 +75,7 @@ interface InstallOptions {
   excludeHosts?: string[];
   debug?: boolean;
   toolPolicy?: HeadroomToolPolicyInput;
+  sessionToken?: string;
 }
 
 interface CompiledToolPolicyRule {
@@ -117,6 +119,7 @@ interface TransportState {
   previousExcludeHostsEnv?: string;
   previousToolPolicyEnv?: string;
   previousToolPolicyValidUntilEnv?: string;
+  sessionToken: string | undefined;
   originalFetch: typeof fetch;
   originalHttpRequest: HttpRequest;
   originalHttpGet: HttpGet;
@@ -239,7 +242,7 @@ function setState(state: TransportState | undefined): void {
 }
 
 // ponytail: the shim only exists next to the checkout build
-// (plugins/opencode/dist/). The wheel ships entry.opencode.js alone, so
+// (plugins/opencode/dist/). The wheel shipped the entry bundle alone, so
 // `--import=<missing file>` killed every Node child at startup — including
 // OpenCode's stdio MCP servers (issue #2798). No shim on disk, no injection:
 // children go direct instead of dying. Upgrade path is bundling the shim into
@@ -1746,7 +1749,12 @@ function isLoopback(hostname: string): boolean {
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 }
 
-function normalizeExcludeHosts(entries: string | Iterable<unknown>): string[] {
+// "example.com", ".example.com" and "*.example.com" all mean the host itself
+// plus every subdomain. Entries are bare hosts: no scheme, port, or path. A
+// string is the comma-separated env form; plugin options arrive from untyped
+// JSON, so a lone string there is treated the same way instead of iterated
+// character by character.
+export function normalizeExcludeHosts(entries: string | Iterable<unknown>): string[] {
   const hosts = new Set<string>();
   for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
     const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
@@ -1772,7 +1780,7 @@ function isLlmEndpointPath(pathname: string): boolean {
   );
 }
 
-function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
+function isRoutableUpstream(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return false;
   }
@@ -1785,7 +1793,28 @@ function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (isExcludedHost(url.hostname, excludeHosts)) {
     return false;
   }
-  return isLlmEndpointPath(url.pathname);
+  return true;
+}
+
+function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
+  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+}
+
+// OpenCode 2.x hands the plugin model base URLs (e.g.
+// https://opencode.ai/zen/go/v1), not inference endpoints: setup appends the
+// wire path when it rewrites the model, so the endpoint-suffix check cannot
+// apply. Eligibility is the shared host/protocol contract only — http(s),
+// not loopback, not the proxy itself, not an excluded host.
+export function modelBaseRoutesThroughProxy(
+  baseUrl: string,
+  proxyUrl: string,
+  excludeHosts: string[] = [],
+): boolean {
+  try {
+    return isRoutableUpstream(new URL(baseUrl), normalizeProxyUrl(proxyUrl), excludeHosts);
+  } catch {
+    return false;
+  }
 }
 
 function routedUrl(upstream: URL, proxy: URL): URL {
@@ -1833,6 +1862,7 @@ function mergeFetchHeaders(
   upstream: URL | undefined,
   originalPath: string | undefined = undefined,
   project: string | undefined = undefined,
+  sessionToken: string | undefined = undefined,
 ): Headers {
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   if (init?.headers) {
@@ -1848,6 +1878,9 @@ function mergeFetchHeaders(
   if (project) {
     headers.set(PROJECT_HEADER, project);
   }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
+  }
   return headers;
 }
 
@@ -1857,6 +1890,7 @@ function withRoutedFetchInput(
   proxy: URL,
   project: string | undefined,
   excludeHosts: string[],
+  sessionToken: string | undefined,
 ): FetchArgs {
   const upstream = requestUrl(input);
   if (!shouldRoute(upstream, proxy, excludeHosts)) {
@@ -1866,7 +1900,7 @@ function withRoutedFetchInput(
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath, project),
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project, sessionToken),
   };
 
   if (input instanceof Request) {
@@ -1924,6 +1958,7 @@ function headersForNodeRequest(
   upstream: URL,
   originalPath: string | undefined,
   project: string | undefined,
+  sessionToken: string | undefined,
 ): Record<string, string> {
   const headers = new Headers(options.headers as HeadersInit | undefined);
   headers.set(BASE_URL_HEADER, upstream.origin);
@@ -1932,6 +1967,9 @@ function headersForNodeRequest(
   }
   if (project) {
     headers.set(PROJECT_HEADER, project);
+  }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
   }
   headers.delete("host");
 
@@ -1947,6 +1985,7 @@ function routedNodeOptions(
   proxy: URL,
   project: string | undefined,
   excludeHosts: string[],
+  sessionToken: string | undefined,
 ): Record<string, unknown> | undefined {
   if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
     return undefined;
@@ -1980,7 +2019,7 @@ function routedNodeOptions(
     hostname: nextUrl.hostname,
     port: nextUrl.port || undefined,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project),
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project, sessionToken),
   };
 }
 
@@ -2004,7 +2043,13 @@ function wrapRequest(
         url: parts.url,
       });
     }
-    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts);
+    const nextOptions = routedNodeOptions(
+      parts,
+      proxy,
+      state.project,
+      state.excludeHosts,
+      state.sessionToken,
+    );
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -2083,6 +2128,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     existing.project = options.project;
     existing.excludeHosts = excludeHosts;
     existing.debug = Boolean(options.debug);
+    existing.sessionToken = options.sessionToken;
     installProcessEnv(options.proxyUrl, excludeHosts, existing.toolPolicy);
     return () => uninstallHeadroomTransport();
   }
@@ -2104,6 +2150,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     previousExcludeHostsEnv: process.env[EXCLUDE_HOSTS_ENV],
     previousToolPolicyEnv: process.env[TOOL_POLICY_ENV],
     previousToolPolicyValidUntilEnv: process.env[TOOL_POLICY_VALID_UNTIL_ENV],
+    sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
     originalHttpGet: http.get,
@@ -2137,6 +2184,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
       proxy,
       current.project,
       current.excludeHosts,
+      current.sessionToken,
     );
     return state.originalFetch(nextInput, nextInit);
   };

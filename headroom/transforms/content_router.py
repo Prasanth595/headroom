@@ -80,6 +80,7 @@ from .compressor_registry import (
 from .content_detector import (
     ContentType,
     DetectionResult,
+    _try_detect_git_status,
     _try_detect_log,
     _try_detect_search,
     _try_detect_structured_config,
@@ -236,6 +237,13 @@ def _compression_deadline_seconds() -> float:
         )
     except ValueError:
         return 20.0
+
+
+def _compress_workers() -> int:
+    try:
+        return int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
+    except ValueError:
+        return 4
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -1202,6 +1210,12 @@ def _detect_content(content: str) -> DetectionResult:
     # Detect on the unwrapped payload so a tool-output envelope's tags don't get
     # the whole result misclassified as HTML/XML (#route-converter corruption).
     content = _strip_detection_envelope(content)
+
+    # Status paths/state are structural ground truth even if Magika assigns
+    # another content type; retain the format metadata on both backends.
+    git_status = _try_detect_git_status(content)
+    if git_status is not None:
+        return git_status
 
     backend = _resolve_detect_backend()
     if backend == "python":
@@ -2475,7 +2489,6 @@ class ContentRouter(Transform):
         # skip — i.e. revert it to original text and bust the provider prefix
         # cache. Counting pins isolates the freeze's attributable payoff.
         self._freeze_pin_hits = 0
-        self._freeze_pin_chars = 0
 
     # ── #3486: per-request runtime state accessors ──────────────────────
     #
@@ -2610,7 +2623,6 @@ class ContentRouter(Transform):
         preserved = max(0, int(len(content) * (1.0 - cached_ratio)))
         with self._frozen_lock:
             self._freeze_pin_hits += 1
-            self._freeze_pin_chars += preserved
             hits = self._freeze_pin_hits
         logger.info(
             f"FREEZE-PIN: pins={hits} cached_ratio={cached_ratio:.3f} "
@@ -3048,6 +3060,9 @@ class ContentRouter(Transform):
             mixed = is_mixed_content(content)
         if detection is None:
             detection = _detect_content(content)
+
+        if detection.metadata.get("format") == "git_status":
+            return CompressionStrategy.TABULAR
 
         # 1. Check for mixed content
         if mixed:
@@ -3829,6 +3844,11 @@ class ContentRouter(Transform):
             log]``). Log readers use this to see *how* we got to the
             final compressor without parsing decision_reason strings.
         """
+        # Git status is path/state ground truth, not a rectangular CSV table.
+        # Preserve it before embedded-JSON, lossy-after-fold and external stages.
+        if _try_detect_git_status(_strip_detection_envelope(content)) is not None:
+            return content, _estimate_tokens(content), [CompressionStrategy.TABULAR.value]
+
         # ── STRUCTURAL (embedded) JSON routing ───────────────────────────────
         # Before anything else: if this block is not a single JSON value but
         # CONTAINS balanced JSON span(s), route each span through this very
@@ -6528,9 +6548,7 @@ class ContentRouter(Transform):
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
-            max_workers = min(
-                len(pending_tasks), int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
-            )
+            max_workers = min(len(pending_tasks), _compress_workers())
             t_parallel_start = time.perf_counter()
 
             if max_workers <= 1 or len(pending_tasks) == 1:
@@ -7865,24 +7883,3 @@ class ContentRouter(Transform):
         Always returns True - the router handles all content types.
         """
         return True
-
-
-def route_and_compress(
-    content: str,
-    context: str = "",
-) -> str:
-    """Convenience function for one-off routing and compression.
-
-    Args:
-        content: Content to compress.
-        context: Optional context for relevance-aware compression.
-
-    Returns:
-        Compressed content.
-
-    Example:
-        >>> compressed = route_and_compress(mixed_content)
-    """
-    router = ContentRouter()
-    result = router.compress(content, context=context)
-    return result.compressed

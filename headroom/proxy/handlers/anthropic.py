@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
+from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -32,6 +33,7 @@ import httpx
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
+from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy import public_errors
@@ -55,6 +57,7 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import (
     extract_tags,
+    invalid_request_body_message,
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
 )
@@ -66,6 +69,7 @@ from headroom.proxy.model_router import estimate_input_tokens, request_max_token
 from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.provider_usage import anthropic_cache_ttl_buckets, usage_int
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
@@ -169,28 +173,21 @@ class _AnthropicTurnHookUsage:
         self.cache_write_1h_tokens = 0
         self.extra_calls = 0
 
-    @staticmethod
-    def _int(value: Any) -> int:
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
-
     def record(self, payload: Any) -> None:
         usage = payload.get("usage") if isinstance(payload, dict) else None
         if not isinstance(usage, dict):
             self._seen.append((payload, 0, 0, 0, 0, 0, 0))
             return
-        cache_read = self._int(usage.get("cache_read_input_tokens"))
-        cache_write = self._int(usage.get("cache_creation_input_tokens"))
+        cache_read = usage_int(usage.get("cache_read_input_tokens"))
+        cache_write = usage_int(usage.get("cache_creation_input_tokens"))
         creation = usage.get("cache_creation")
         cache_write_5m = (
-            self._int(creation.get("ephemeral_5m_input_tokens"))
+            usage_int(creation.get("ephemeral_5m_input_tokens"))
             if isinstance(creation, dict)
             else 0
         )
         cache_write_1h = (
-            self._int(creation.get("ephemeral_1h_input_tokens"))
+            usage_int(creation.get("ephemeral_1h_input_tokens"))
             if isinstance(creation, dict)
             else 0
         )
@@ -198,7 +195,7 @@ class _AnthropicTurnHookUsage:
             (
                 payload,
                 _anthropic_provider_input_tokens(usage),
-                self._int(usage.get("output_tokens")),
+                usage_int(usage.get("output_tokens")),
                 cache_read,
                 cache_write,
                 cache_write_5m,
@@ -238,7 +235,7 @@ def _anthropic_provider_input_tokens(usage: Any) -> int:
     if not isinstance(usage, dict):
         return 0
     return sum(
-        _AnthropicTurnHookUsage._int(usage.get(key))
+        usage_int(usage.get(key))
         for key in (
             "input_tokens",
             "cache_read_input_tokens",
@@ -503,21 +500,6 @@ class AnthropicHandlerMixin:
             and name not in client_tool_names
         )
 
-    @staticmethod
-    def _has_headroom_retrieve_tool(tools: Any) -> bool:
-        """Return True when the final Anthropic tool list includes CCR retrieve."""
-        if not isinstance(tools, list):
-            return False
-        for tool in tools:
-            if not isinstance(tool, dict):
-                continue
-            if tool.get("name") == "headroom_retrieve":
-                return True
-            function = tool.get("function")
-            if isinstance(function, dict) and function.get("name") == "headroom_retrieve":
-                return True
-        return False
-
     def _can_salvage_buffered_upstream(self, resp_json: Any) -> bool:
         """May this upstream response be relayed when post-processing failed?
 
@@ -588,19 +570,10 @@ class AnthropicHandlerMixin:
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
         """Extract observed Anthropic cache-write TTL bucket usage.
 
-        HeadroomProxy also inherits StreamingMixin, which exposes the same
-        helper for SSE usage parsing. Keep this local copy so the Anthropic
-        handler remains safe when tested or embedded without StreamingMixin.
+        StreamingMixin defines the same method; both delegate to one helper so
+        this handler stays usable without StreamingMixin (tests, embedding).
         """
-        if not isinstance(usage, dict):
-            return (0, 0)
-        cache_creation = usage.get("cache_creation")
-        if not isinstance(cache_creation, dict):
-            return (0, 0)
-        return (
-            int(cache_creation.get("ephemeral_5m_input_tokens", 0) or 0),
-            int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
-        )
+        return anthropic_cache_ttl_buckets(usage)
 
     def _anthropic_buffered_request_timeout(self) -> httpx.Timeout:
         """Timeout for buffered Anthropic reads."""
@@ -788,22 +761,13 @@ class AnthropicHandlerMixin:
         frozen_message_count: int,
     ) -> tuple[list[dict[str, Any]], int]:
         """Force frozen prefix bytes to match the original request exactly."""
-        if frozen_message_count <= 0 or not original_messages:
-            return candidate_messages, 0
+        from headroom.cache.prefix_tracker import restore_frozen_prefix
 
-        frozen = min(frozen_message_count, len(original_messages))
-        restored = list(candidate_messages)
-
-        # Defensive: if a transform dropped prefix messages, restore them.
-        if len(restored) < frozen:
-            return list(original_messages[:frozen]) + restored, frozen
-
-        changed = 0
-        for idx in range(frozen):
-            if restored[idx] != original_messages[idx]:
-                restored[idx] = original_messages[idx]
-                changed += 1
-        return restored, changed
+        return restore_frozen_prefix(
+            original_messages,
+            candidate_messages,
+            frozen_message_count=frozen_message_count,
+        )
 
     @staticmethod
     def _extract_cache_stable_delta(
@@ -1165,7 +1129,7 @@ class AnthropicHandlerMixin:
                         "type": "error",
                         "error": {
                             "type": "invalid_request_error",
-                            "message": f"Invalid request body: {e!s}",
+                            "message": invalid_request_body_message(e),
                         },
                     },
                 )
@@ -1704,6 +1668,11 @@ class AnthropicHandlerMixin:
                     "output_config": body.get("output_config"),
                 }
             )
+            # Resolve the request's actual provider TTL before tracker lookup:
+            # get_or_create may sweep expired sessions on this request.
+            from headroom.transforms.cold_prefix import anthropic_cache_ttl_seconds
+
+            _cc_ttl = anthropic_cache_ttl_seconds(model, original_client_messages, system_prompt)
             # Resolve the tracker by conversation lineage within the session id
             # (#2085): one model + system prompt spans a Claude Code session and
             # all its parallel subagents, so concurrent conversations share this
@@ -1715,6 +1684,7 @@ class AnthropicHandlerMixin:
                 "anthropic",
                 messages=session_messages,
                 cache_affinity=cache_affinity,
+                cache_ttl_seconds=_cc_ttl,
             )
             # Snapshot lineage state once.  Reusing the same pair for delta
             # extraction, byte-stable replay, and breakpoint placement keeps
@@ -1748,14 +1718,8 @@ class AnthropicHandlerMixin:
             # lossless whole-prefix recompaction instead of the byte-identical splice
             # (the splice preserves a dead cache) and skips the overlay replay. Both are
             # deterministic → the recompacted prefix re-caches byte-stable on warm turns.
-            from headroom.transforms.cold_prefix import (
-                anthropic_cache_ttl_seconds,
-                is_cold_prefix,
-            )
+            from headroom.transforms.cold_prefix import is_cold_prefix
 
-            # Resolve the authoritative request-level prompt-cache tier once.
-            # The same value drives cold-prefix handling and net-cost pricing.
-            _cc_ttl = anthropic_cache_ttl_seconds(model, original_client_messages, system_prompt)
             _cold_recompact_active = False
             if os.environ.get("HEADROOM_COLD_RECOMPACT", "").strip().lower() in (
                 "1",
@@ -2505,11 +2469,11 @@ class AnthropicHandlerMixin:
 
             # Mechanism B: activity-based read maturation (flag-gated,
             # default off). Runs after compression so read_lifecycle
-            # markers are respected, and before body assembly so the
-            # held-Read breakpoint relocation lands in the forwarded
-            # request. Session state (matured markers) rides on the
-            # prefix tracker — same affinity and TTL cleanup as the
-            # freeze state. Advisory: must never fail the request.
+            # markers are respected, and before body assembly so a
+            # matured marker lands in the forwarded request. Session
+            # state (matured markers) rides on the prefix tracker — same
+            # affinity and TTL cleanup as the freeze state. Advisory:
+            # must never fail the request.
             # Bound when maturation runs, so the final accounting step below
             # can charge this request's replayed-marker debt. Every earlier
             # `tokens_saved` assignment is overwritten by that recount, so the
@@ -2518,10 +2482,7 @@ class AnthropicHandlerMixin:
             if self.config.read_maturation and not _bypass:
                 try:
                     from headroom.config import ReadMaturationConfig
-                    from headroom.transforms.read_maturation import (
-                        ReadMaturationManager,
-                        relocate_cache_breakpoint,
-                    )
+                    from headroom.transforms.read_maturation import ReadMaturationManager
 
                     maturation_mgr = prefix_tracker.read_maturation_manager
                     if maturation_mgr is None:
@@ -2541,10 +2502,7 @@ class AnthropicHandlerMixin:
                         frozen_message_count=frozen_message_count,
                     )
                     if maturation.replacements_applied or maturation.holding_msg_indices:
-                        optimized_messages = relocate_cache_breakpoint(
-                            maturation.messages,
-                            maturation.holding_msg_indices,
-                        )
+                        optimized_messages = maturation.messages
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
                         tokens_saved = max(0, original_tokens - optimized_tokens)
                         if maturation.newly_matured:
@@ -3370,7 +3328,11 @@ class AnthropicHandlerMixin:
                 except Exception:
                     _pre_hook_tokens = None
                 _th_tools_before = body.get("tools")
-                _th_tok_before = _count_tool_tokens(_th_tools_before) if _th_tools_before else 0
+                _th_tok_before = (
+                    _count_tool_tokens(without_deferral_flags(_th_tools_before))
+                    if _th_tools_before
+                    else 0
+                )
                 run_request_hooks(_req_ctx, stream_safe_only=bool(stream))
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
@@ -3382,7 +3344,11 @@ class AnthropicHandlerMixin:
                 # so measure the FINAL tools object. Deferral-shaped (removes schemas
                 # count_messages never saw), hence a tag rather than a fold — mirrors
                 # the OpenAI chat path so a turn-hook extension is credited on both.
-                _th_tok_after = _count_tool_tokens(_req_ctx.tools) if _req_ctx.tools else 0
+                _th_tok_after = (
+                    _count_tool_tokens(without_deferral_flags(_req_ctx.tools))
+                    if _req_ctx.tools
+                    else 0
+                )
                 _th_saved = max(0, _th_tok_before - _th_tok_after)
                 if _th_saved > 0:
                     tags["turn_hook_tools_saved_tokens"] = (
@@ -3554,6 +3520,7 @@ class AnthropicHandlerMixin:
                 from headroom.proxy.output_shaper import (
                     OutputShaperSettings,
                     classify_turn,
+                    output_holdout_fraction,
                     resolve_verbosity_level,
                     shape_request,
                 )
@@ -3567,15 +3534,8 @@ class AnthropicHandlerMixin:
                     # conversation is treatment or control. This keeps the A/B
                     # comparison clean AND keeps the prefix cache stable (we
                     # never flip a conversation's system-prompt tail mid-stream).
-                    from headroom.proxy import runtime_env
-
-                    _holdout = 0.0
-                    try:
-                        _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-                    except ValueError:
-                        _holdout = 0.0
                     _conversation = conversation_key_from_body(body)
-                    _arm = assign_arm(_conversation, _holdout)
+                    _arm = assign_arm(_conversation, output_holdout_fraction())
 
                     # Stratum from request features observable now (mirrors the
                     # offline baseline so live and learned strata line up).
@@ -4008,9 +3968,7 @@ class AnthropicHandlerMixin:
                 retrieve_tool_is_offered = (
                     stream
                     and ccr_response_handler_enabled
-                    and self._has_headroom_retrieve_tool(
-                        tools if tools is not None else body.get("tools")
-                    )
+                    and has_ccr_retrieve_tool(tools if tools is not None else body.get("tools"))
                 )
                 buffered_retrieval_can_help = (
                     retrieve_tool_is_offered and self._outgoing_body_has_redeemable_marker(body)
@@ -4731,18 +4689,62 @@ class AnthropicHandlerMixin:
                                     request_context=memory_request_ctx,
                                 )
 
-                                if tool_results:
+                                turn_content = resp_json.get("content") or []
+                                answered = {result.get("tool_use_id") for result in tool_results}
+                                unanswered = [
+                                    block
+                                    for block in turn_content
+                                    if isinstance(block, dict)
+                                    and block.get("type") == "tool_use"
+                                    and block.get("id") not in answered
+                                ]
+                                if tool_results and unanswered:
+                                    # The continuation replays this whole turn, and
+                                    # Anthropic rejects any tool_use without a result
+                                    # (#4009). Only the client can answer its own
+                                    # tools, so the turn goes back to it, minus the
+                                    # memory calls it never declared and that already
+                                    # ran here (same rule as the streaming path, #3947).
+                                    logger.info(
+                                        f"[{request_id}] Memory: Turn also called a client "
+                                        "tool; returning the turn to the client"
+                                    )
+                                    resp_json = {
+                                        **resp_json,
+                                        "content": [
+                                            block
+                                            for block in turn_content
+                                            if not (
+                                                isinstance(block, dict)
+                                                and block.get("type") == "tool_use"
+                                                and block.get("name") in server_memory_tool_names
+                                            )
+                                        ],
+                                    }
+                                    response = httpx.Response(
+                                        status_code=200,
+                                        content=json.dumps(resp_json).encode(),
+                                        headers={
+                                            key: value
+                                            for key, value in response.headers.items()
+                                            if key.lower()
+                                            not in ("content-encoding", "content-length")
+                                        },
+                                    )
+                                elif tool_results:
                                     # Create continuation messages
                                     assistant_msg = {
                                         "role": "assistant",
-                                        "content": resp_json.get("content", []),
+                                        "content": turn_content,
                                     }
                                     user_msg = {
                                         "role": "user",
                                         "content": tool_results,
                                     }
 
-                                    continuation_messages = optimized_messages + [
+                                    # body["messages"], not optimized_messages: it is
+                                    # what this turn actually sent upstream.
+                                    continuation_messages = body["messages"] + [
                                         assistant_msg,
                                         user_msg,
                                     ]
@@ -4763,9 +4765,16 @@ class AnthropicHandlerMixin:
                                     # Update response with continuation
                                     resp_json = cont_response.json()
                                     response = cont_response
-                                    logger.info(
-                                        f"[{request_id}] Memory: Tool calls handled, continuation complete"
-                                    )
+                                    if cont_response.status_code >= 400:
+                                        logger.warning(
+                                            f"[{request_id}] Memory: Continuation failed with "
+                                            f"upstream status {cont_response.status_code}"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"[{request_id}] Memory: Tool calls handled, "
+                                            "continuation complete"
+                                        )
 
                             except Exception as e:
                                 logger.warning(
@@ -5599,7 +5608,7 @@ class AnthropicHandlerMixin:
                     "type": "error",
                     "error": {
                         "type": "invalid_request_error",
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                     },
                 },
             )
