@@ -2616,7 +2616,9 @@ class AnthropicHandlerMixin:
                 # they can drive tool injection (issue #2836).
                 ccr_present_hashes = injector.verify_ownership()
                 if inject_system_instructions and injector.has_compressed_content:
-                    optimized_messages = injector.inject_into_system_message(optimized_messages)
+                    optimized_messages = injector.inject_into_system_message(
+                        optimized_messages, tools=tools
+                    )
 
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless

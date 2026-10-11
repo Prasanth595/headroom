@@ -70,6 +70,11 @@ wrappers such as `mcp__headroom__headroom_retrieve` and
 injection and the per-request fallback, so Headroom does not advertise an
 unavailable bare retrieval tool alongside the client's executable alias.
 
+These ownership aliases are limited to the default `headroom` MCP server
+name. An unrelated server such as `mcp__other__headroom_retrieve` does not
+replace the proxy's retrieval tool. Optional CCR system instructions use
+the executable name selected from the available tool definitions.
+
 ## Phase 3: Response Handler
 
 When the LLM calls `headroom_retrieve`:
@@ -83,6 +88,9 @@ On the Anthropic and OpenAI proxy paths, proxy-owned retrieval-only responses
 are resolved server-side. Mixed responses that also call client-owned tools
 are forwarded for the client to execute; MCP-registered retrieval aliases
 remain client-owned.
+
+Alias-only retrieval responses are also forwarded to the client: the proxy
+intercepts only its bare `headroom_retrieve` tool, not MCP-registered aliases.
 
 <Callout type="warning" title="Gemini CCR boundary">
   Buffered native Gemini requests resolve `headroom_retrieve` server-side and

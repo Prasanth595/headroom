@@ -3975,7 +3975,9 @@ class OpenAIHandlerMixin:
                 and not stream
                 and injector.has_compressed_content
             ):
-                optimized_messages = injector.inject_into_system_message(optimized_messages)
+                optimized_messages = injector.inject_into_system_message(
+                    optimized_messages, tools=tools
+                )
 
             if can_inject_ccr_tool:
                 from headroom.proxy.helpers import (

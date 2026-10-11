@@ -30,7 +30,6 @@ from urllib.parse import urlsplit, urlunsplit
 from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 from headroom.cache.compression_cache import _is_tool_result_message
-from headroom.config import is_tool_excluded
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -2811,20 +2810,14 @@ def apply_session_sticky_ccr_tool(
     Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
     fresh list (caller-safe).
     """
-    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+    from headroom.ccr.tool_injection import _client_retrieval_tool_name
 
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
-    existing_names: set[str] = set()
-    for t in tools_out:
-        n = _extract_tool_name(t)
-        if n:
-            existing_names.add(n)
-
-    # Preserve the client registry on mixed-tool turns; it may only know an alias.
-    if any(is_tool_excluded(name, (CCR_TOOL_NAME,)) for name in existing_names):
+    # Only default Headroom aliases claim ownership, not arbitrary MCP servers.
+    if _client_retrieval_tool_name(tools_out):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
