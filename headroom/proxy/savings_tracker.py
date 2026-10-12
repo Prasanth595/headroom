@@ -1921,8 +1921,11 @@ class SavingsTracker:
             ):
                 lifetime_savings_usd = _coerce_signed_float(last["compression_savings_usd"])
             if not isinstance(lifetime_raw, dict) or (
-                "compression_savings_usd" not in lifetime_raw
-                and "legacy_compression_savings_usd" not in lifetime_raw
+                "legacy_compression_savings_usd" not in lifetime_raw
+                and (
+                    lifetime_raw.get("pricing_basis") == PRICING_BASIS
+                    or "compression_savings_usd" not in lifetime_raw
+                )
             ):
                 legacy_savings_usd = _coerce_signed_float(
                     last.get("legacy_compression_savings_usd")
@@ -1940,8 +1943,11 @@ class SavingsTracker:
                     last.get("tool_schema_savings_usd")
                 )
             if not isinstance(lifetime_raw, dict) or (
-                "tool_schema_savings_usd" not in lifetime_raw
-                and "legacy_tool_schema_savings_usd" not in lifetime_raw
+                "legacy_tool_schema_savings_usd" not in lifetime_raw
+                and (
+                    lifetime_raw.get("pricing_basis") == PRICING_BASIS
+                    or "tool_schema_savings_usd" not in lifetime_raw
+                )
             ):
                 legacy_tool_savings_usd = _coerce_signed_float(
                     last.get("legacy_tool_schema_savings_usd")

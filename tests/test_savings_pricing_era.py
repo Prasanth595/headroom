@@ -156,6 +156,46 @@ def test_signed_lifetime_audit_survives_older_checkpoint_flush_and_restart(tmp_p
     assert restarted["lifetime"]["tokens_saved"] == 1000
 
 
+def test_priced_lifetime_recovers_missing_audits_independently_after_restart(tmp_path):
+    path = tmp_path / "savings.json"
+    tracker = SavingsTracker(path=str(path))
+    tracker.record_request(
+        model="sample-model",
+        input_tokens=1000,
+        tokens_saved=100,
+        tool_search_saved=10,
+        estimated_savings_usd={
+            "compression": 0.01,
+            "tool_schema": 0.002,
+            "basis": BASIS_CATALOG,
+        },
+    )
+    tracker.flush()
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["lifetime"].pop("legacy_compression_savings_usd")
+    state["lifetime"]["legacy_tool_schema_savings_usd"] = -20.0
+    state["history"][-1]["legacy_compression_savings_usd"] = 100.0
+    state["history"][-1]["legacy_tool_schema_savings_usd"] = -10.0
+    path.write_text(json.dumps(state), encoding="utf-8", newline="\n")
+
+    partial = SavingsTracker(path=str(path))
+    partial.flush()
+    recovered = SavingsTracker(path=str(path)).snapshot()["lifetime"]
+    assert recovered["legacy_compression_savings_usd"] == 100.0
+    assert recovered["legacy_tool_schema_savings_usd"] == -20.0
+    assert recovered["compression_savings_usd"] == pytest.approx(0.012)
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved["lifetime"].pop("legacy_tool_schema_savings_usd")
+    path.write_text(json.dumps(saved), encoding="utf-8", newline="\n")
+    missing_tool = SavingsTracker(path=str(path))
+    missing_tool.flush()
+    recovered_tool = SavingsTracker(path=str(path)).snapshot()["lifetime"]
+    assert recovered_tool["legacy_compression_savings_usd"] == 100.0
+    assert recovered_tool["legacy_tool_schema_savings_usd"] == -10.0
+    assert recovered_tool["compression_savings_usd"] == pytest.approx(0.012)
+
+
 def test_durable_lifetime_cost_does_not_mix_unversioned_and_new_prices(tmp_path):
     state = _legacy_state()
     state["lifetime_metrics"] = {
