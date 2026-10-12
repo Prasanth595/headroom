@@ -48,7 +48,8 @@ def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> No
         lambda manifest: calls.append(f"start:{manifest.profile}"),
     )
     monkeypatch.setattr(
-        "headroom.install.runtime.wait_ready", lambda manifest, timeout_seconds=45: True
+        "headroom.install.runtime.wait_ready",
+        lambda manifest, timeout_seconds=45, require_identity=False: True,
     )
     monkeypatch.setattr(
         wrap_cli,
@@ -81,7 +82,8 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
         lambda manifest: calls.append(f"start:{manifest.profile}"),
     )
     monkeypatch.setattr(
-        "headroom.install.runtime.wait_ready", lambda manifest, timeout_seconds=45: True
+        "headroom.install.runtime.wait_ready",
+        lambda manifest, timeout_seconds=45, require_identity=False: True,
     )
     monkeypatch.setattr(
         wrap_cli,
@@ -316,6 +318,31 @@ def test_recover_persistent_proxy_warns_for_task_deployment(monkeypatch) -> None
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
 
     assert wrap_cli._recover_persistent_proxy(8787) is False
+
+
+def test_recover_persistent_proxy_routes_docker_task_to_docker_supervisor(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class DockerTaskManifest(_Manifest):
+        preset = "persistent-task"
+        runtime_kind = "docker"
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: DockerTaskManifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.install.runtime.runtime_ready", lambda manifest: False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.start_persistent_docker",
+        lambda manifest: calls.append("docker"),
+    )
+    waits: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "headroom.install.runtime.wait_ready",
+        lambda manifest, **kwargs: waits.append(kwargs) or True,
+    )
+
+    assert wrap_cli._recover_persistent_proxy(8787) is True
+    assert calls == ["docker"]
+    assert waits == [{"timeout_seconds": 45, "require_identity": True}]
 
 
 def test_ensure_proxy_restarts_idle_stale_ephemeral_proxy(monkeypatch) -> None:
