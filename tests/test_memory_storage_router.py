@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -172,6 +173,29 @@ def test_resolver_unencodable_cli_override_falls_through_to_system_prompt() -> N
     assert out is not None
     _, display = out
     assert display == "headroom"
+
+
+def test_resolver_symlink_to_undecodable_name_does_not_raise(tmp_path: Path) -> None:
+    # The cwd itself is plain UTF-8, but realpath follows the symlink to a
+    # non-UTF-8 filename and returns it as a ``\udcXX`` surrogate escape.
+    base = os.fsencode(tmp_path)
+    try:
+        os.mkdir(base + b"/\xff-target")
+    except OSError:
+        pytest.skip("filesystem rejects non-UTF-8 filenames (e.g. macOS APFS)")
+    os.symlink(base + b"/\xff-target", base + b"/link")
+    prompt = f"Primary working directory: {tmp_path}/link\n"
+    assert ProjectResolver().resolve(_ctx(system_prompt=prompt)) is None
+
+
+def test_resolver_realpath_returning_surrogate_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same case as above on any OS: realpath yields what Linux returns for a
+    # symlink to a non-UTF-8 filename.
+    monkeypatch.setattr(os.path, "realpath", lambda _p: "/work/\udcff-target")
+    prompt = "Primary working directory: /work/link\n"
+    assert ProjectResolver().resolve(_ctx(system_prompt=prompt)) is None
 
 
 def test_resolver_valid_non_ascii_cwd_still_resolves() -> None:
