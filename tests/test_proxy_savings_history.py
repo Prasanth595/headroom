@@ -83,7 +83,6 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
     lifetime = snapshot["lifetime"]
     assert lifetime["tokens_saved"] == 30
     assert lifetime["compression_savings_usd"] == 0.0
-    assert lifetime["legacy_compression_savings_usd"] == pytest.approx(0.03)
     assert [point["timestamp"] for point in snapshot["history"]] == ["2026-03-27T09:00:00Z"]
     assert snapshot["history"][0]["total_tokens_saved"] == 30
 

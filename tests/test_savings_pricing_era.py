@@ -119,13 +119,41 @@ def test_history_only_legacy_dollars_cannot_reseed_the_priced_lifetime(tmp_path,
     state = _legacy_state()
     state.pop("lifetime")
     state["history"][0]["compression_savings_usd"] = dollars
+    state["history"][0]["tool_schema_savings_usd"] = dollars / 5
     path = tmp_path / "savings.json"
     path.write_text(json.dumps(state), encoding="utf-8", newline="\n")
+    tracker = SavingsTracker(path=str(path))
+    tracker.flush()
     result = SavingsTracker(path=str(path)).snapshot()["lifetime"]
 
     assert result["compression_savings_usd"] == 0.0
     assert result["legacy_compression_savings_usd"] == dollars
+    assert result["legacy_tool_schema_savings_usd"] == dollars / 5
     assert result["tokens_saved"] == 1000
+
+
+def test_signed_lifetime_audit_survives_older_checkpoint_flush_and_restart(tmp_path):
+    state = _legacy_state()
+    state["lifetime"]["compression_savings_usd"] = -100.0
+    state["lifetime"]["tool_schema_savings_usd"] = -20.0
+    state["history"][0]["compression_savings_usd"] = -50.0
+    state["history"][0]["tool_schema_savings_usd"] = -10.0
+    path = tmp_path / "savings.json"
+    path.write_text(json.dumps(state), encoding="utf-8", newline="\n")
+
+    tracker = SavingsTracker(path=str(path))
+    loaded = tracker.snapshot()["lifetime"]
+    assert loaded["legacy_compression_savings_usd"] == -100.0
+    assert loaded["legacy_tool_schema_savings_usd"] == -20.0
+    assert loaded["compression_savings_usd"] == 0.0
+    tracker.flush()
+
+    restarted = SavingsTracker(path=str(path)).history_response(history_mode="full")
+    assert restarted["lifetime"]["legacy_compression_savings_usd"] == -100.0
+    assert restarted["lifetime"]["legacy_tool_schema_savings_usd"] == -20.0
+    assert restarted["history"][0]["legacy_compression_savings_usd"] == -50.0
+    assert restarted["history"][0]["legacy_tool_schema_savings_usd"] == -10.0
+    assert restarted["lifetime"]["tokens_saved"] == 1000
 
 
 def test_durable_lifetime_cost_does_not_mix_unversioned_and_new_prices(tmp_path):

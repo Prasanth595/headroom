@@ -1927,11 +1927,6 @@ class SavingsTracker:
                 legacy_savings_usd = _coerce_signed_float(
                     last.get("legacy_compression_savings_usd")
                 )
-            else:
-                legacy_savings_usd = max(
-                    legacy_savings_usd,
-                    _coerce_signed_float(last.get("legacy_compression_savings_usd")),
-                )
             lifetime_tool_tokens_saved = max(
                 lifetime_tool_tokens_saved,
                 _coerce_int(last.get("tool_tokens_saved")),
@@ -1950,11 +1945,6 @@ class SavingsTracker:
             ):
                 legacy_tool_savings_usd = _coerce_signed_float(
                     last.get("legacy_tool_schema_savings_usd")
-                )
-            else:
-                legacy_tool_savings_usd = max(
-                    legacy_tool_savings_usd,
-                    _coerce_signed_float(last.get("legacy_tool_schema_savings_usd")),
                 )
             lifetime_input_tokens = max(
                 lifetime_input_tokens,

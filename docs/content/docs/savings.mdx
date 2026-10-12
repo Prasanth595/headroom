@@ -85,6 +85,11 @@ the pricing method and legacy audit amounts, including signed legacy balances.
 Restarting the proxy does not reclassify those new estimates or move them into
 a later hourly bucket.
 
+An explicit lifetime audit balance remains authoritative when reconciling retained
+history, including when it is negative or lower than the last checkpoint.
+History supplies an audit balance only when the lifetime field is absent;
+a numeric maximum is not a freshness rule for signed amounts.
+
 History and rollup JSON/CSV exports retain the legacy audit amounts.
 Legacy tool-schema values may overlap the legacy compression total: older
 schemas differed in what they folded into that total. Treat both as audit
