@@ -237,6 +237,15 @@ class ProjectResolver:
         cwd = unquote(raw_cwd.strip()) if percent_encoded else raw_cwd.strip()
         if not cwd:
             return None
+        # A cwd with no UTF-8 form (an unpaired surrogate, e.g. from a
+        # JSON-decoded ``\ud800`` escape) cannot name a real directory and
+        # cannot be hashed without a lossy encoding that could merge distinct
+        # paths. Treat it as unusable so resolution falls through to the next
+        # tier, or fails closed, instead of raising (#4162).
+        try:
+            cwd.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
         # Normalise so symlinked / trailing-slash variants collapse to
         # the same key. ``realpath`` falls back to the input when the
         # path doesn't exist on this host, which is the right behaviour
