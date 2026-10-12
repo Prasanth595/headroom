@@ -197,16 +197,6 @@ def _get_env_int(name: str, default: int) -> int:
     return default if value is None else value
 
 
-def _get_env_float_optional(name: str) -> float | None:
-    val = os.environ.get(name)
-    if val is None or val == "":
-        return None
-    try:
-        return float(val)
-    except ValueError:
-        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
-
-
 def _resolve_bedrock_client_hook(hook_spec: str | None) -> "Callable[[str | None], Any] | None":
     """Resolve a 'module:function' string to a callable for ``--bedrock-client-hook``.
 
