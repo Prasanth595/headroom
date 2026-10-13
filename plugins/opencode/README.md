@@ -590,10 +590,20 @@ The default export is `{ id: "headroom", server, setup }`. OpenCode 1.x calls `s
 - default to `HEADROOM_PROXY_URL`, then `http://127.0.0.1:8787`, when no `proxyUrl` option is supplied.
 - skip routing for hosts listed in `excludeHosts` (or `HEADROOM_OPENCODE_EXCLUDE_HOSTS`); those requests go straight upstream with no compression or telemetry.
 
-On 2.x, setup returns a cleanup that retires pending native calls and releases the
-transport, so hot reloads do not leave unresolved policy decisions or stack interceptors.
+On 2.x, setup returns a cleanup that disposes the catalog, tool, shell, and session
+registrations, retires pending native calls, and releases the transport. Hot reloads
+therefore do not retain old model routes, hooks, unresolved decisions, or interceptors.
 
-OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching `fetch` alone does not catch its model traffic. On 2.x the plugin also rewrites each remote model that uses the OpenAI chat-completions or responses format so that it points at the proxy. Headers name the real upstream, as the transport does. Models on other formats (Anthropic messages, Google) are left alone. `headroom wrap opencode` routes native Anthropic and OpenAI through the proxy separately, via their `baseURL`.
+OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching
+`fetch` alone does not catch its model traffic. On 2.x the plugin uses the runtime's
+catalog transform (or the newer model transform when available) to point each remote
+OpenAI chat-completions or responses model at the proxy. The per-request session hook
+adds the authoritative project directory, and the same session lookup selects repository
+policy before model or tool execution when setup itself has no location. A plugin
+instance fails closed rather than switching between different repository-policy roots.
+Models on other formats (Anthropic messages, Google) are left alone. `headroom wrap
+opencode` routes native Anthropic and OpenAI through the proxy separately, via their
+`baseURL`.
 
 To keep a provider off the proxy, list its host. An entry matches the host and all of its subdomains, and `.example.com` / `*.example.com` are accepted as spellings of `example.com`:
 

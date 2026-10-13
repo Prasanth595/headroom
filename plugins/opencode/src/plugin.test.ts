@@ -44,51 +44,107 @@ function pluginContextV2(
   const tools: Array<Record<string, any>> = [];
   const shellHooks: Array<(input: { env: Record<string, string | undefined> }) => unknown> = [];
   const toolHooks: Record<string, Array<(input: any) => unknown>> = {};
+  const sessionHooks: Record<string, Array<(input: any) => unknown>> = {};
+  const disposals: Record<string, ReturnType<typeof vi.fn>[]> = {};
   const providers = catalog.providers ?? [];
   const models = catalog.models ?? [];
+  const catalogProviders = [
+    ...providers,
+    ...models
+      .filter(
+        (model) => !providers.some((provider) => provider.id === model.providerID),
+      )
+      .map((model) => ({
+        id: model.providerID,
+        package: model.package ?? "",
+      })),
+  ];
+  const registration = (name: string) => {
+    const dispose = vi.fn(async () => {});
+    (disposals[name] ??= []).push(dispose);
+    return { dispose };
+  };
+  const routingEditor = {
+    provider: {
+      list: () =>
+        catalogProviders.map((provider) => ({
+          provider,
+          models: new Map(
+            models
+              .filter((model) => model.providerID === provider.id)
+              .map((model) => [model.id, model]),
+          ),
+        })),
+      get: (providerID: string) => {
+        const provider = catalogProviders.find(
+          (candidate) => candidate.id === providerID,
+        );
+        return provider ? { provider, models: new Map() } : undefined;
+      },
+    },
+    model: {
+      get: (providerID: string, modelID: string) =>
+        models.find(
+          (model) => model.providerID === providerID && model.id === modelID,
+        ),
+      update: (
+        providerID: string,
+        modelID: string,
+        update: (model: FakeModel) => void,
+      ) => {
+        const model = models.find(
+          (candidate) =>
+            candidate.providerID === providerID && candidate.id === modelID,
+        );
+        if (model) update(model);
+      },
+    },
+  };
   const context = {
     options,
     location: {
       directory: "/repo",
       project: { id: "project-1", directory: "/repo", canonical: "/repo" },
     },
-    model: {
+    catalog: {
       transform: vi.fn(async (callback: (editor: Record<string, any>) => void) => {
-        callback({
-          list: () => models,
-          update: (providerID: string, modelID: string, update: (model: FakeModel) => void) => {
-            const model = models.find((m) => m.providerID === providerID && m.id === modelID);
-            if (model) update(model);
-          },
-          provider: {
-            get: (providerID: string) => {
-              const provider = providers.find((p) => p.id === providerID);
-              return provider ? { provider, models: new Map() } : undefined;
-            },
-          },
-        });
-        return { dispose: async () => {} };
+        callback(routingEditor);
+        return registration("catalog.transform");
+      }),
+    },
+    session: {
+      get: vi.fn(async () => ({ location: { directory: "/repo" } })),
+      hook: vi.fn(async (name: string, callback: (input: any) => unknown) => {
+        (sessionHooks[name] ??= []).push(callback);
+        return registration(`session.${name}`);
       }),
     },
     tool: {
       transform: vi.fn(async (callback: (editor: { add: (tool: Record<string, any>) => void }) => void) => {
         callback({ add: (tool) => tools.push(tool) });
-        return { dispose: async () => {} };
+        return registration("tool.transform");
       }),
       hook: vi.fn(async (name: string, callback: (input: any) => unknown) => {
         (toolHooks[name] ??= []).push(callback);
-        return { dispose: async () => {} };
+        return registration(`tool.${name}`);
       }),
     },
     shell: {
       hook: vi.fn(async (name: string, callback: (input: { env: Record<string, string | undefined> }) => unknown) => {
         expect(name).toBe("create.before");
         shellHooks.push(callback);
-        return { dispose: async () => {} };
+        return registration(`shell.${name}`);
       }),
     },
   };
-  return { context: context as never, tools, shellHooks, toolHooks };
+  return {
+    context: context as never,
+    tools,
+    shellHooks,
+    toolHooks,
+    sessionHooks,
+    disposals,
+  };
 }
 
 function transportState(): { refs: number } | undefined {
@@ -872,8 +928,8 @@ describe("HeadroomPlugin", () => {
 });
 
 describe("headroomSetup (OpenCode 2.x)", () => {
-  it("uses the process directory when the live runtime omits location and model", async () => {
-    const { context, shellHooks } = pluginContextV2({
+  it("uses the session directory when the live runtime omits setup location", async () => {
+    const { context, sessionHooks, shellHooks } = pluginContextV2({
       proxyUrl: "http://127.0.0.1:8787",
       toolPolicy: { rules: [] },
     });
@@ -885,11 +941,61 @@ describe("headroomSetup (OpenCode 2.x)", () => {
     runtimeContext.model = undefined;
 
     const cleanup = await headroomSetup(context);
+    const modelRequest = { sessionID: "session-live", headers: {} as Record<string, string> };
+    await sessionHooks["model.request"][0](modelRequest);
     const shell = { env: {} as Record<string, string | undefined> };
     await shellHooks[0](shell);
 
+    expect(modelRequest.headers["x-headroom-project"]).toBe(path.resolve("/repo"));
     expect(shell.env.HEADROOM_PROJECT).toBe(process.cwd());
     await cleanup?.();
+  });
+
+  it("discovers repository policy from the authoritative session directory", async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-v2-policy-"));
+    const previousConfigDir = process.env.HEADROOM_CONFIG_DIR;
+    process.env.HEADROOM_CONFIG_DIR = path.join(repo, "empty-global-config");
+    fs.mkdirSync(path.join(repo, ".headroom"));
+    fs.writeFileSync(
+      path.join(repo, ".headroom", "tool_policy.json"),
+      JSON.stringify({
+        rules: [
+          { id: "deny-session-curl", scope: "shell", action: "deny", command: "curl" },
+        ],
+      }),
+    );
+    const { context, toolHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+    });
+    const runtimeContext = context as unknown as {
+      location?: unknown;
+      session: { get: ReturnType<typeof vi.fn> };
+    };
+    runtimeContext.location = undefined;
+    runtimeContext.session.get = vi.fn(async () => ({
+      location: { directory: repo },
+    }));
+
+    try {
+      const cleanup = await headroomSetup(context);
+      await expect(
+        toolHooks["execute.before"][0]({
+          tool: "shell",
+          sessionID: "session-repository",
+          messageID: "message-repository",
+          id: "call-repository",
+          input: { command: "curl example.test" },
+        }),
+      ).rejects.toThrow(/deny-session-curl/);
+      expect(runtimeContext.session.get).toHaveBeenCalledWith({
+        sessionID: "session-repository",
+      });
+      await cleanup?.();
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.HEADROOM_CONFIG_DIR;
+      else process.env.HEADROOM_CONFIG_DIR = previousConfigDir;
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   it("denies a native tool in execute.before before execution", async () => {
@@ -1145,6 +1251,7 @@ describe("headroomSetup (OpenCode 2.x)", () => {
     const models: FakeModel[] = [
       { id: "deepseek-v4.1-flash", providerID: "opencode-go" },
       { id: "gpt-6-luna", providerID: "gateway", package: "@opencode/ai/providers/openai/responses" },
+      { id: "space-bunny-free", providerID: "opencode" },
     ];
     const { context } = pluginContextV2(
       { proxyUrl: "http://127.0.0.1:8787/" },
@@ -1159,6 +1266,11 @@ describe("headroomSetup (OpenCode 2.x)", () => {
             id: "gateway",
             package: "@opencode/ai/providers/openai-compatible",
             settings: { baseURL: "https://gateway.example/api/v1" },
+          },
+          {
+            id: "opencode",
+            package: "aisdk:@ai-sdk/openai-compatible",
+            settings: { baseURL: "https://opencode.ai/inference/v1" },
           },
         ],
         models,
@@ -1181,6 +1293,13 @@ describe("headroomSetup (OpenCode 2.x)", () => {
       headers: {
         "x-headroom-base-url": "https://gateway.example",
         "x-headroom-original-path": "/api/v1/responses",
+      },
+    });
+    expect(models[2]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": "https://opencode.ai",
+        "x-headroom-original-path": "/inference/v1/chat/completions",
       },
     });
   });
@@ -1399,12 +1518,18 @@ describe("headroomSetup (OpenCode 2.x)", () => {
   });
 
   it("releases the transport on cleanup so reloads do not leak it", async () => {
-    const { context } = pluginContextV2({ proxyUrl: "http://127.0.0.1:8787" });
+    const { context, disposals } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+    });
 
     const first = await headroomSetup(context);
     expect(transportState()?.refs).toBe(1);
     await first?.();
     expect(transportState()).toBeUndefined();
+    expect(Object.values(disposals).flat()).toHaveLength(6);
+    for (const dispose of Object.values(disposals).flat()) {
+      expect(dispose).toHaveBeenCalledOnce();
+    }
 
     const second = await headroomSetup(context);
     expect(transportState()?.refs).toBe(1);
@@ -1413,13 +1538,17 @@ describe("headroomSetup (OpenCode 2.x)", () => {
   });
 
   it("releases the transport when hook registration fails", async () => {
-    const { context } = pluginContextV2({ proxyUrl: "http://127.0.0.1:8787" });
+    const { context, disposals } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+    });
     (context as { shell: { hook: () => Promise<never> } }).shell.hook = async () => {
       throw new Error("registration failed");
     };
 
     await expect(headroomSetup(context)).rejects.toThrow("registration failed");
     expect(transportState()).toBeUndefined();
+    expect(disposals["catalog.transform"][0]).toHaveBeenCalledOnce();
+    expect(disposals["tool.transform"][0]).toHaveBeenCalledOnce();
   });
 });
 

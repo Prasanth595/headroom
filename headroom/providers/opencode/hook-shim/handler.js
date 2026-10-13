@@ -240,7 +240,8 @@ function resolveToolPolicySource(options, existing) {
       input: options.toolPolicy,
       source: "configured",
       identity: `configured:${policySourceFingerprint(options.toolPolicy)}`,
-      remoteToken: ""
+      remoteToken: "",
+      repositoryScoped: false
     };
   }
   const installedPolicy = existing?.toolPolicy?.serialized;
@@ -254,7 +255,8 @@ function resolveToolPolicySource(options, existing) {
       source: TOOL_POLICY_ENV,
       identity: `${TOOL_POLICY_ENV}:${policySourceFingerprint(policyJson)}`,
       remoteToken: "",
-      validUntil: parsePropagatedValidUntil(propagatedExpiry)
+      validUntil: parsePropagatedValidUntil(propagatedExpiry),
+      repositoryScoped: false
     };
   }
   const configuredPath = process.env[TOOL_POLICY_PATH_ENV]?.trim();
@@ -263,7 +265,8 @@ function resolveToolPolicySource(options, existing) {
       input: configuredPath,
       source: TOOL_POLICY_PATH_ENV,
       identity: `${TOOL_POLICY_PATH_ENV}:${path.resolve(configuredPath)}`,
-      remoteToken: ""
+      remoteToken: "",
+      repositoryScoped: false
     };
   }
   const remoteUrl = process.env[TOOL_POLICY_URL_ENV]?.trim() || void 0;
@@ -273,7 +276,8 @@ function resolveToolPolicySource(options, existing) {
       source: TOOL_POLICY_URL_ENV,
       identity: `${TOOL_POLICY_URL_ENV}:${remoteUrl}`,
       remoteUrl,
-      remoteToken
+      remoteToken,
+      repositoryScoped: false
     };
   }
   const globalPath = defaultGlobalToolPolicyPath();
@@ -282,7 +286,8 @@ function resolveToolPolicySource(options, existing) {
       input: globalPath,
       source: globalPath,
       identity: `global:${path.resolve(globalPath)}`,
-      remoteToken: ""
+      remoteToken: "",
+      repositoryScoped: false
     };
   }
   const localPath = findLocalToolPolicyPath(options.policyProject ?? options.project);
@@ -291,10 +296,16 @@ function resolveToolPolicySource(options, existing) {
       input: localPath,
       source: localPath,
       identity: `repository:${path.resolve(localPath)}`,
-      remoteToken: ""
+      remoteToken: "",
+      repositoryScoped: true
     };
   }
-  return { source: "unconfigured", identity: "unconfigured", remoteToken: "" };
+  return {
+    source: "unconfigured",
+    identity: "unconfigured",
+    remoteToken: "",
+    repositoryScoped: true
+  };
 }
 function workspaceDir() {
   return process.env.HEADROOM_WORKSPACE_DIR?.trim() || path.join(os.homedir(), ".headroom");
@@ -1497,6 +1508,7 @@ function installHeadroomTransport(options) {
     remotePolicyUrl: selectedSource.remoteUrl,
     remotePolicyToken: selectedSource.remoteToken,
     policyUnavailable,
+    dynamicRepositoryPolicy: selectedSource.repositoryScoped,
     previousNodeOptions: process.env.NODE_OPTIONS,
     previousProxyUrlEnv: process.env[PROXY_ENV],
     previousExcludeHostsEnv: process.env[EXCLUDE_HOSTS_ENV],

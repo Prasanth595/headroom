@@ -12728,7 +12728,8 @@ function resolveToolPolicySource(options, existing) {
       input: options.toolPolicy,
       source: "configured",
       identity: `configured:${policySourceFingerprint(options.toolPolicy)}`,
-      remoteToken: ""
+      remoteToken: "",
+      repositoryScoped: false
     };
   }
   const installedPolicy = existing?.toolPolicy?.serialized;
@@ -12742,7 +12743,8 @@ function resolveToolPolicySource(options, existing) {
       source: TOOL_POLICY_ENV,
       identity: `${TOOL_POLICY_ENV}:${policySourceFingerprint(policyJson)}`,
       remoteToken: "",
-      validUntil: parsePropagatedValidUntil(propagatedExpiry)
+      validUntil: parsePropagatedValidUntil(propagatedExpiry),
+      repositoryScoped: false
     };
   }
   const configuredPath = process.env[TOOL_POLICY_PATH_ENV]?.trim();
@@ -12751,7 +12753,8 @@ function resolveToolPolicySource(options, existing) {
       input: configuredPath,
       source: TOOL_POLICY_PATH_ENV,
       identity: `${TOOL_POLICY_PATH_ENV}:${path.resolve(configuredPath)}`,
-      remoteToken: ""
+      remoteToken: "",
+      repositoryScoped: false
     };
   }
   const remoteUrl = process.env[TOOL_POLICY_URL_ENV]?.trim() || void 0;
@@ -12761,7 +12764,8 @@ function resolveToolPolicySource(options, existing) {
       source: TOOL_POLICY_URL_ENV,
       identity: `${TOOL_POLICY_URL_ENV}:${remoteUrl}`,
       remoteUrl,
-      remoteToken
+      remoteToken,
+      repositoryScoped: false
     };
   }
   const globalPath = defaultGlobalToolPolicyPath();
@@ -12770,7 +12774,8 @@ function resolveToolPolicySource(options, existing) {
       input: globalPath,
       source: globalPath,
       identity: `global:${path.resolve(globalPath)}`,
-      remoteToken: ""
+      remoteToken: "",
+      repositoryScoped: false
     };
   }
   const localPath = findLocalToolPolicyPath(options.policyProject ?? options.project);
@@ -12779,10 +12784,16 @@ function resolveToolPolicySource(options, existing) {
       input: localPath,
       source: localPath,
       identity: `repository:${path.resolve(localPath)}`,
-      remoteToken: ""
+      remoteToken: "",
+      repositoryScoped: true
     };
   }
-  return { source: "unconfigured", identity: "unconfigured", remoteToken: "" };
+  return {
+    source: "unconfigured",
+    identity: "unconfigured",
+    remoteToken: "",
+    repositoryScoped: true
+  };
 }
 function workspaceDir() {
   return process.env.HEADROOM_WORKSPACE_DIR?.trim() || path.join(os.homedir(), ".headroom");
@@ -12976,6 +12987,41 @@ async function refreshHeadroomToolPolicy(now = Date.now() / 1e3) {
     state.toolPolicy = void 0;
     state.policyUnavailable = error45 instanceof Error ? error45.message : String(error45);
   }
+}
+function activateHeadroomRepositoryPolicy(policyProject) {
+  const state = getState();
+  if (!state || !state.dynamicRepositoryPolicy) return;
+  const resolvedProject = path.resolve(policyProject);
+  if (state.repositoryPolicyProject === resolvedProject) return;
+  if (state.repositoryPolicyProject) {
+    throw new Error(
+      "[headroom] Multiple OpenCode repository locations share one plugin instance; refusing to replace the active repository policy"
+    );
+  }
+  const selectedSource = resolveToolPolicySource(
+    {
+      proxyUrl: state.proxyUrl,
+      project: state.project,
+      policyProject: resolvedProject
+    },
+    state
+  );
+  try {
+    state.toolPolicy = compileToolPolicy(
+      selectedSource.input,
+      resolvedProject,
+      selectedSource.source
+    );
+    if (state.toolPolicy && selectedSource.validUntil !== void 0) {
+      state.toolPolicy.validUntil = selectedSource.validUntil;
+    }
+    state.policyUnavailable = void 0;
+  } catch (error45) {
+    state.toolPolicy = void 0;
+    state.policyUnavailable = error45 instanceof Error ? error45.message : String(error45);
+  }
+  state.repositoryPolicyProject = resolvedProject;
+  installProcessEnv(state.proxyUrl, state.excludeHosts, state.toolPolicy);
 }
 function withShimEnv(env, proxyUrl, excludeHosts, toolPolicy) {
   const nextEnv = { ...env ?? process.env };
@@ -14084,6 +14130,7 @@ function installHeadroomTransport(options) {
     remotePolicyUrl: selectedSource.remoteUrl,
     remotePolicyToken: selectedSource.remoteToken,
     policyUnavailable,
+    dynamicRepositoryPolicy: selectedSource.repositoryScoped,
     previousNodeOptions: process.env.NODE_OPTIONS,
     previousProxyUrlEnv: process.env[PROXY_ENV],
     previousExcludeHostsEnv: process.env[EXCLUDE_HOSTS_ENV],
@@ -14233,9 +14280,9 @@ function createNativeToolLifecycle(projectPath, options) {
     options.maxRetiredCallIdentities,
     DEFAULT_MAX_RETIRED_CALL_IDENTITIES
   );
-  const effectiveCwd = (args) => {
-    const configured = typeof args.workdir === "string" ? args.workdir : projectPath;
-    return path2.resolve(projectPath, configured);
+  const effectiveCwd = (args, effectiveProjectPath = projectPath) => {
+    const configured = typeof args.workdir === "string" ? args.workdir : effectiveProjectPath;
+    return path2.resolve(effectiveProjectPath, configured);
   };
   const hasRetiredCallKey = (key) => retiredCallHistoryExhausted || retiredCallFingerprints.has(retiredCallFingerprint(key));
   const retireCallKey = (key) => {
@@ -14256,7 +14303,7 @@ function createNativeToolLifecycle(projectPath, options) {
     retireCallKey(key);
     acknowledgeUnknownNativeToolExecution(pending.preflight, reason);
   };
-  const rememberPreflight = (key, preflight) => {
+  const rememberPreflight = (key, preflight, effectiveProjectPath) => {
     finishUnknown(key, "call_replaced");
     const ambiguous = hasRetiredCallKey(key);
     while (pendingPreflights.size >= maxPendingPreflights) {
@@ -14269,19 +14316,25 @@ function createNativeToolLifecycle(projectPath, options) {
       pendingPreflightTtlMs
     );
     timer.unref?.();
-    pendingPreflights.set(key, { preflight, ambiguous, timer });
+    pendingPreflights.set(key, {
+      preflight,
+      ambiguous,
+      projectPath: effectiveProjectPath,
+      timer
+    });
   };
   return {
     async before(toolName, args, execution) {
+      const effectiveProjectPath = execution.projectPath ?? projectPath;
       const preflight = await enforceNativeToolExecution(
         toolName,
         args,
-        effectiveCwd(args),
+        effectiveCwd(args, effectiveProjectPath),
         execution
       );
       if (!preflight) return false;
       freezeArguments(args);
-      rememberPreflight(nativeCallKey(execution), preflight);
+      rememberPreflight(nativeCallKey(execution), preflight, effectiveProjectPath);
       return true;
     },
     after(toolName, args, execution) {
@@ -14297,7 +14350,7 @@ function createNativeToolLifecycle(projectPath, options) {
           pending.preflight,
           toolName,
           args,
-          effectiveCwd(args),
+          effectiveCwd(args, pending.projectPath),
           execution
         );
         pendingPreflights.delete(key);
@@ -14317,7 +14370,7 @@ function createNativeToolLifecycle(projectPath, options) {
           pending.preflight,
           toolName,
           args,
-          effectiveCwd(args),
+          effectiveCwd(args, pending.projectPath),
           execution
         );
         finishUnknown(key, "postflight_error");
@@ -14371,6 +14424,7 @@ function applyHeadroomShellEnv(env, proxyUrl, project, options) {
   }
 }
 function openAiWireSuffix(pkg) {
+  if (pkg === "aisdk:@ai-sdk/openai-compatible") return "/chat/completions";
   if (!pkg?.startsWith("@opencode/ai/providers/")) return void 0;
   if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
     return "/chat/completions";
@@ -14398,6 +14452,26 @@ function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessio
         ...sessionToken ? { [SESSION_TOKEN_HEADER]: sessionToken } : {}
       };
     });
+  }
+}
+function catalogRoutingEditor(catalog) {
+  return {
+    list: () => catalog.provider.list().flatMap(({ models }) => [...models.values()]),
+    update: (providerID, modelID, update) => {
+      catalog.model.update(providerID, modelID, update);
+    },
+    provider: {
+      get: (providerID) => catalog.provider.get(providerID)
+    }
+  };
+}
+async function disposeRegistrations(registrations) {
+  const results = await Promise.allSettled(
+    [...registrations].reverse().map((registration) => registration.dispose())
+  );
+  const failures = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+  if (failures.length) {
+    throw new AggregateError(failures, "Failed to dispose OpenCode registrations");
   }
 }
 var HeadroomPlugin = async (input, options = {}) => {
@@ -14467,6 +14541,7 @@ var headroomSetup = async (ctx) => {
   const excludeHosts = resolveExcludeHosts(pluginOptions);
   const sessionToken = resolveSessionToken(pluginOptions);
   const nativeLifecycle = createNativeToolLifecycle(projectPath, pluginOptions);
+  const registrations = [];
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
@@ -14476,14 +14551,49 @@ var headroomSetup = async (ctx) => {
     toolPolicy: pluginOptions.toolPolicy,
     sessionToken
   });
+  const sessionProjectPath = async (sessionID) => {
+    if (runtimeCtx.location?.directory) {
+      return path2.resolve(runtimeCtx.location.directory);
+    }
+    if (!runtimeCtx.session?.get) {
+      throw new Error(
+        "[headroom] OpenCode did not expose a project location or session lookup; repository policy enforcement cannot be initialized safely"
+      );
+    }
+    const session = await runtimeCtx.session.get({ sessionID });
+    const directory = session.location?.directory;
+    if (!directory) {
+      throw new Error(
+        `[headroom] OpenCode session ${sessionID} has no project directory; repository policy enforcement cannot continue`
+      );
+    }
+    return path2.resolve(directory);
+  };
   try {
     await refreshHeadroomToolPolicy();
-    if (runtimeCtx.model) {
-      await runtimeCtx.model.transform((models) => {
-        routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
-      });
+    if (runtimeCtx.location?.directory) {
+      activateHeadroomRepositoryPolicy(runtimeCtx.location.directory);
     }
-    await ctx.tool.transform((editor) => {
+    if (runtimeCtx.model) {
+      registrations.push(await runtimeCtx.model.transform((models) => {
+        routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
+      }));
+    } else if (runtimeCtx.catalog) {
+      registrations.push(await runtimeCtx.catalog.transform((catalog) => {
+        routeModelsThroughProxy(
+          catalogRoutingEditor(catalog),
+          proxyUrl,
+          project,
+          excludeHosts,
+          sessionToken
+        );
+      }));
+    } else {
+      throw new Error(
+        "[headroom] OpenCode did not expose a model or catalog transform; model traffic cannot be routed through Headroom safely"
+      );
+    }
+    registrations.push(await ctx.tool.transform((editor) => {
       editor.add({
         name: retrieveTool.name,
         description: retrieveTool.description,
@@ -14495,15 +14605,29 @@ var headroomSetup = async (ctx) => {
           return { content: await retrieveTool.execute(args) };
         }
       });
-    });
-    await ctx.shell.hook("create.before", (shell) => {
+    }));
+    registrations.push(await ctx.shell.hook("create.before", (shell) => {
       applyHeadroomShellEnv(shell.env, proxyUrl, project, pluginOptions);
-    });
-    await ctx.tool.hook("execute.before", async (input) => {
+    }));
+    if (runtimeCtx.session?.hook) {
+      registrations.push(await runtimeCtx.session.hook("model.request", async (input) => {
+        const directory = await sessionProjectPath(String(input.sessionID));
+        activateHeadroomRepositoryPolicy(directory);
+        input.headers[PROJECT_HEADER] = pluginOptions.project ?? directory;
+      }));
+    } else if (!runtimeCtx.location?.directory) {
+      throw new Error(
+        "[headroom] OpenCode did not expose a project location or model-request hook; repository policy enforcement cannot be initialized before model traffic"
+      );
+    }
+    registrations.push(await ctx.tool.hook("execute.before", async (input) => {
+      const directory = await sessionProjectPath(String(input.sessionID));
+      activateHeadroomRepositoryPolicy(directory);
       const execution = {
         sessionID: String(input.sessionID),
         callID: String(input.id),
-        taskID: String(input.messageID)
+        taskID: String(input.messageID),
+        projectPath: directory
       };
       const bound = await nativeLifecycle.before(
         input.tool,
@@ -14511,8 +14635,8 @@ var headroomSetup = async (ctx) => {
         execution
       );
       if (bound) Object.freeze(input);
-    });
-    await ctx.tool.hook("execute.after", (input) => {
+    }));
+    registrations.push(await ctx.tool.hook("execute.after", (input) => {
       const execution = {
         sessionID: String(input.sessionID),
         callID: String(input.id),
@@ -14527,15 +14651,32 @@ var headroomSetup = async (ctx) => {
         return;
       }
       nativeLifecycle.after(input.tool, toolArguments(input.input), execution);
-    });
+    }));
   } catch (error45) {
-    nativeLifecycle.dispose();
-    uninstallTransport();
+    let disposalError;
+    try {
+      await disposeRegistrations(registrations);
+    } catch (caught) {
+      disposalError = caught;
+    } finally {
+      nativeLifecycle.dispose();
+      uninstallTransport();
+    }
+    if (disposalError) {
+      throw new AggregateError(
+        [error45, disposalError],
+        "OpenCode setup and registration cleanup both failed"
+      );
+    }
     throw error45;
   }
-  return () => {
-    nativeLifecycle.dispose();
-    uninstallTransport();
+  return async () => {
+    try {
+      await disposeRegistrations(registrations);
+    } finally {
+      nativeLifecycle.dispose();
+      uninstallTransport();
+    }
   };
 };
 var HeadroomOpenCodePlugin = {

@@ -12,6 +12,7 @@ import {
 } from "./retrieve.js";
 import type { HeadroomToolPolicyConfig } from "./transport.js";
 import {
+  activateHeadroomRepositoryPolicy,
   acknowledgeNativeToolExecution,
   acknowledgeUnknownNativeToolExecution,
   assertNativeToolExecutionBinding,
@@ -53,6 +54,7 @@ const DEFAULT_MAX_RETIRED_CALL_IDENTITIES = 65_536;
 interface PendingPreflight {
   preflight: NonNullable<Awaited<ReturnType<typeof enforceNativeToolExecution>>>;
   ambiguous: boolean;
+  projectPath: string;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -60,6 +62,7 @@ interface NativeExecutionIdentity {
   sessionID: string;
   callID: string;
   taskID?: string;
+  projectPath?: string;
 }
 
 function positiveInteger(value: number | undefined, fallback: number): number {
@@ -116,9 +119,13 @@ function createNativeToolLifecycle(
     DEFAULT_MAX_RETIRED_CALL_IDENTITIES,
   );
 
-  const effectiveCwd = (args: Record<string, unknown>): string => {
-    const configured = typeof args.workdir === "string" ? args.workdir : projectPath;
-    return path.resolve(projectPath, configured);
+  const effectiveCwd = (
+    args: Record<string, unknown>,
+    effectiveProjectPath = projectPath,
+  ): string => {
+    const configured =
+      typeof args.workdir === "string" ? args.workdir : effectiveProjectPath;
+    return path.resolve(effectiveProjectPath, configured);
   };
 
   const hasRetiredCallKey = (key: string): boolean =>
@@ -151,6 +158,7 @@ function createNativeToolLifecycle(
   const rememberPreflight = (
     key: string,
     preflight: NonNullable<Awaited<ReturnType<typeof enforceNativeToolExecution>>>,
+    effectiveProjectPath: string,
   ): void => {
     finishUnknown(key, "call_replaced");
     const ambiguous = hasRetiredCallKey(key);
@@ -164,7 +172,12 @@ function createNativeToolLifecycle(
       pendingPreflightTtlMs,
     );
     timer.unref?.();
-    pendingPreflights.set(key, { preflight, ambiguous, timer });
+    pendingPreflights.set(key, {
+      preflight,
+      ambiguous,
+      projectPath: effectiveProjectPath,
+      timer,
+    });
   };
 
   return {
@@ -173,15 +186,16 @@ function createNativeToolLifecycle(
       args: Record<string, unknown>,
       execution: NativeExecutionIdentity,
     ): Promise<boolean> {
+      const effectiveProjectPath = execution.projectPath ?? projectPath;
       const preflight = await enforceNativeToolExecution(
         toolName,
         args,
-        effectiveCwd(args),
+        effectiveCwd(args, effectiveProjectPath),
         execution,
       );
       if (!preflight) return false;
       freezeArguments(args);
-      rememberPreflight(nativeCallKey(execution), preflight);
+      rememberPreflight(nativeCallKey(execution), preflight, effectiveProjectPath);
       return true;
     },
     after(
@@ -201,7 +215,7 @@ function createNativeToolLifecycle(
           pending.preflight,
           toolName,
           args,
-          effectiveCwd(args),
+          effectiveCwd(args, pending.projectPath),
           execution,
         );
         pendingPreflights.delete(key);
@@ -225,7 +239,7 @@ function createNativeToolLifecycle(
           pending.preflight,
           toolName,
           args,
-          effectiveCwd(args),
+          effectiveCwd(args, pending.projectPath),
           execution,
         );
         finishUnknown(key, "postflight_error");
@@ -306,6 +320,7 @@ function applyHeadroomShellEnv(
 // on the OpenAI chat-completions or responses wire format; undefined otherwise.
 // `.../messages` (Anthropic wire) and other protocols are left alone.
 function openAiWireSuffix(pkg: string | undefined): string | undefined {
+  if (pkg === "aisdk:@ai-sdk/openai-compatible") return "/chat/completions";
   if (!pkg?.startsWith("@opencode/ai/providers/")) return undefined;
   if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
     return "/chat/completions";
@@ -320,10 +335,58 @@ function openAiWireSuffix(pkg: string | undefined): string | undefined {
 // remote OpenAI-wire model at the proxy instead, with the same routing headers
 // the transport sends: the upstream origin, and the real path the proxy
 // appends to it.
-type ModelEditor = Parameters<Parameters<PluginV2.Context["model"]["transform"]>[0]>[0];
+interface RoutingModel {
+  id: unknown;
+  providerID: unknown;
+  package?: string;
+  settings?: Record<string, unknown>;
+  headers?: Record<string, string>;
+}
+
+interface RoutingProvider {
+  package?: string;
+  settings?: Record<string, unknown>;
+}
+
+interface RoutingModelEditor {
+  list(): readonly RoutingModel[];
+  update(
+    providerID: string,
+    modelID: string,
+    update: (model: RoutingModel) => void,
+  ): void;
+  provider: {
+    get(providerID: string): { provider: RoutingProvider } | undefined;
+  };
+}
+
+interface Registration {
+  dispose(): Promise<void>;
+}
+
+interface RuntimeCatalogEditor {
+  provider: {
+    list(): readonly {
+      provider: RoutingProvider & { id: unknown };
+      models: Map<unknown, RoutingModel>;
+    }[];
+    get(providerID: string): { provider: RoutingProvider } | undefined;
+  };
+  model: {
+    update(
+      providerID: string,
+      modelID: string,
+      update: (model: RoutingModel) => void,
+    ): void;
+  };
+}
+
+interface RuntimeCatalogDomain {
+  transform(callback: (editor: RuntimeCatalogEditor) => void): Promise<Registration>;
+}
 
 function routeModelsThroughProxy(
-  models: ModelEditor,
+  models: RoutingModelEditor,
   proxyUrl: string,
   project: string,
   excludeHosts: string[],
@@ -349,6 +412,33 @@ function routeModelsThroughProxy(
         ...(sessionToken ? { [SESSION_TOKEN_HEADER]: sessionToken } : {}),
       };
     });
+  }
+}
+
+function catalogRoutingEditor(catalog: RuntimeCatalogEditor): RoutingModelEditor {
+  return {
+    list: () =>
+      catalog.provider
+        .list()
+        .flatMap(({ models }) => [...models.values()]),
+    update: (providerID, modelID, update) => {
+      catalog.model.update(providerID, modelID, update);
+    },
+    provider: {
+      get: (providerID) => catalog.provider.get(providerID),
+    },
+  };
+}
+
+async function disposeRegistrations(registrations: Registration[]): Promise<void> {
+  const results = await Promise.allSettled(
+    [...registrations].reverse().map((registration) => registration.dispose()),
+  );
+  const failures = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason);
+  if (failures.length) {
+    throw new AggregateError(failures, "Failed to dispose OpenCode registrations");
   }
 }
 
@@ -427,6 +517,19 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
       project?: { id?: string };
     };
     model?: PluginV2.Context["model"];
+    catalog?: RuntimeCatalogDomain;
+    session?: {
+      get(input: { sessionID: string }): Promise<{
+        location?: { directory?: string };
+      }>;
+      hook(
+        name: "model.request",
+        callback: (input: {
+          sessionID: string;
+          headers: Record<string, string>;
+        }) => Promise<void> | void,
+      ): Promise<Registration>;
+    };
   };
   const pluginOptions = ctx.options as HeadroomOpenCodePluginOptions;
   const proxyUrl = resolveProxyUrl(pluginOptions);
@@ -437,6 +540,7 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
   const excludeHosts = resolveExcludeHosts(pluginOptions);
   const sessionToken = resolveSessionToken(pluginOptions);
   const nativeLifecycle = createNativeToolLifecycle(projectPath, pluginOptions);
+  const registrations: Registration[] = [];
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
@@ -446,15 +550,53 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
     toolPolicy: pluginOptions.toolPolicy,
     sessionToken,
   });
+  const sessionProjectPath = async (sessionID: string): Promise<string> => {
+    if (runtimeCtx.location?.directory) {
+      return path.resolve(runtimeCtx.location.directory);
+    }
+    if (!runtimeCtx.session?.get) {
+      throw new Error(
+        "[headroom] OpenCode did not expose a project location or session lookup; " +
+          "repository policy enforcement cannot be initialized safely",
+      );
+    }
+    const session = await runtimeCtx.session.get({ sessionID });
+    const directory = session.location?.directory;
+    if (!directory) {
+      throw new Error(
+        `[headroom] OpenCode session ${sessionID} has no project directory; ` +
+          "repository policy enforcement cannot continue",
+      );
+    }
+    return path.resolve(directory);
+  };
 
   try {
     await refreshHeadroomToolPolicy();
-    if (runtimeCtx.model) {
-      await runtimeCtx.model.transform((models) => {
-        routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
-      });
+    if (runtimeCtx.location?.directory) {
+      activateHeadroomRepositoryPolicy(runtimeCtx.location.directory);
     }
-    await ctx.tool.transform((editor) => {
+    if (runtimeCtx.model) {
+      registrations.push(await runtimeCtx.model.transform((models) => {
+        routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
+      }));
+    } else if (runtimeCtx.catalog) {
+      registrations.push(await runtimeCtx.catalog.transform((catalog) => {
+        routeModelsThroughProxy(
+          catalogRoutingEditor(catalog),
+          proxyUrl,
+          project,
+          excludeHosts,
+          sessionToken,
+        );
+      }));
+    } else {
+      throw new Error(
+        "[headroom] OpenCode did not expose a model or catalog transform; " +
+          "model traffic cannot be routed through Headroom safely",
+      );
+    }
+    registrations.push(await ctx.tool.transform((editor) => {
       editor.add({
         name: retrieveTool.name,
         description: retrieveTool.description,
@@ -466,15 +608,30 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
           return { content: await retrieveTool.execute(args as { hash: string }) };
         },
       });
-    });
-    await ctx.shell.hook("create.before", (shell) => {
+    }));
+    registrations.push(await ctx.shell.hook("create.before", (shell) => {
       applyHeadroomShellEnv(shell.env, proxyUrl, project, pluginOptions);
-    });
-    await ctx.tool.hook("execute.before", async (input) => {
+    }));
+    if (runtimeCtx.session?.hook) {
+      registrations.push(await runtimeCtx.session.hook("model.request", async (input) => {
+        const directory = await sessionProjectPath(String(input.sessionID));
+        activateHeadroomRepositoryPolicy(directory);
+        input.headers[PROJECT_HEADER] = pluginOptions.project ?? directory;
+      }));
+    } else if (!runtimeCtx.location?.directory) {
+      throw new Error(
+        "[headroom] OpenCode did not expose a project location or model-request hook; " +
+          "repository policy enforcement cannot be initialized before model traffic",
+      );
+    }
+    registrations.push(await ctx.tool.hook("execute.before", async (input) => {
+      const directory = await sessionProjectPath(String(input.sessionID));
+      activateHeadroomRepositoryPolicy(directory);
       const execution = {
         sessionID: String(input.sessionID),
         callID: String(input.id),
         taskID: String(input.messageID),
+        projectPath: directory,
       };
       const bound = await nativeLifecycle.before(
         input.tool,
@@ -482,8 +639,8 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
         execution,
       );
       if (bound) Object.freeze(input);
-    });
-    await ctx.tool.hook("execute.after", (input) => {
+    }));
+    registrations.push(await ctx.tool.hook("execute.after", (input) => {
       const execution = {
         sessionID: String(input.sessionID),
         callID: String(input.id),
@@ -498,16 +655,33 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
         return;
       }
       nativeLifecycle.after(input.tool, toolArguments(input.input), execution);
-    });
+    }));
   } catch (error) {
-    nativeLifecycle.dispose();
-    uninstallTransport();
+    let disposalError: unknown;
+    try {
+      await disposeRegistrations(registrations);
+    } catch (caught) {
+      disposalError = caught;
+    } finally {
+      nativeLifecycle.dispose();
+      uninstallTransport();
+    }
+    if (disposalError) {
+      throw new AggregateError(
+        [error, disposalError],
+        "OpenCode setup and registration cleanup both failed",
+      );
+    }
     throw error;
   }
 
-  return () => {
-    nativeLifecycle.dispose();
-    uninstallTransport();
+  return async () => {
+    try {
+      await disposeRegistrations(registrations);
+    } finally {
+      nativeLifecycle.dispose();
+      uninstallTransport();
+    }
   };
 };
 

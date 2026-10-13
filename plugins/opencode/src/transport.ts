@@ -114,6 +114,8 @@ interface TransportState {
   remotePolicyUrl?: string;
   remotePolicyToken: string;
   policyUnavailable?: string;
+  dynamicRepositoryPolicy: boolean;
+  repositoryPolicyProject?: string;
   previousNodeOptions?: string;
   previousProxyUrlEnv?: string;
   previousExcludeHostsEnv?: string;
@@ -455,6 +457,7 @@ interface ResolvedToolPolicySource {
   remoteUrl?: string;
   remoteToken: string;
   validUntil?: number;
+  repositoryScoped: boolean;
 }
 
 function parsePropagatedValidUntil(value: string | undefined): number | undefined {
@@ -477,6 +480,7 @@ function resolveToolPolicySource(
       source: "configured",
       identity: `configured:${policySourceFingerprint(options.toolPolicy)}`,
       remoteToken: "",
+      repositoryScoped: false,
     };
   }
 
@@ -498,6 +502,7 @@ function resolveToolPolicySource(
       identity: `${TOOL_POLICY_ENV}:${policySourceFingerprint(policyJson)}`,
       remoteToken: "",
       validUntil: parsePropagatedValidUntil(propagatedExpiry),
+      repositoryScoped: false,
     };
   }
 
@@ -508,6 +513,7 @@ function resolveToolPolicySource(
       source: TOOL_POLICY_PATH_ENV,
       identity: `${TOOL_POLICY_PATH_ENV}:${path.resolve(configuredPath)}`,
       remoteToken: "",
+      repositoryScoped: false,
     };
   }
 
@@ -519,6 +525,7 @@ function resolveToolPolicySource(
       identity: `${TOOL_POLICY_URL_ENV}:${remoteUrl}`,
       remoteUrl,
       remoteToken,
+      repositoryScoped: false,
     };
   }
 
@@ -529,6 +536,7 @@ function resolveToolPolicySource(
       source: globalPath,
       identity: `global:${path.resolve(globalPath)}`,
       remoteToken: "",
+      repositoryScoped: false,
     };
   }
   const localPath = findLocalToolPolicyPath(options.policyProject ?? options.project);
@@ -538,9 +546,15 @@ function resolveToolPolicySource(
       source: localPath,
       identity: `repository:${path.resolve(localPath)}`,
       remoteToken: "",
+      repositoryScoped: true,
     };
   }
-  return { source: "unconfigured", identity: "unconfigured", remoteToken: "" };
+  return {
+    source: "unconfigured",
+    identity: "unconfigured",
+    remoteToken: "",
+    repositoryScoped: true,
+  };
 }
 
 function workspaceDir(): string {
@@ -756,6 +770,7 @@ export async function refreshHeadroomToolPolicy(now = Date.now() / 1000): Promis
   if (!state || state.toolPolicyInput !== undefined) {
     return;
   }
+
   const url = state.remotePolicyUrl;
   if (!url) {
     return;
@@ -779,6 +794,44 @@ export async function refreshHeadroomToolPolicy(now = Date.now() / 1000): Promis
     state.toolPolicy = undefined;
     state.policyUnavailable = error instanceof Error ? error.message : String(error);
   }
+}
+
+export function activateHeadroomRepositoryPolicy(policyProject: string): void {
+  const state = getState();
+  if (!state || !state.dynamicRepositoryPolicy) return;
+  const resolvedProject = path.resolve(policyProject);
+  if (state.repositoryPolicyProject === resolvedProject) return;
+  if (state.repositoryPolicyProject) {
+    throw new Error(
+      "[headroom] Multiple OpenCode repository locations share one plugin instance; " +
+        "refusing to replace the active repository policy",
+    );
+  }
+
+  const selectedSource = resolveToolPolicySource(
+    {
+      proxyUrl: state.proxyUrl,
+      project: state.project,
+      policyProject: resolvedProject,
+    },
+    state,
+  );
+  try {
+    state.toolPolicy = compileToolPolicy(
+      selectedSource.input,
+      resolvedProject,
+      selectedSource.source,
+    );
+    if (state.toolPolicy && selectedSource.validUntil !== undefined) {
+      state.toolPolicy.validUntil = selectedSource.validUntil;
+    }
+    state.policyUnavailable = undefined;
+  } catch (error) {
+    state.toolPolicy = undefined;
+    state.policyUnavailable = error instanceof Error ? error.message : String(error);
+  }
+  state.repositoryPolicyProject = resolvedProject;
+  installProcessEnv(state.proxyUrl, state.excludeHosts, state.toolPolicy);
 }
 
 function withShimEnv(
@@ -2157,6 +2210,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     remotePolicyUrl: selectedSource.remoteUrl,
     remotePolicyToken: selectedSource.remoteToken,
     policyUnavailable,
+    dynamicRepositoryPolicy: selectedSource.repositoryScoped,
     previousNodeOptions: process.env.NODE_OPTIONS,
     previousProxyUrlEnv: process.env[PROXY_ENV],
     previousExcludeHostsEnv: process.env[EXCLUDE_HOSTS_ENV],
