@@ -45,7 +45,7 @@ def test_openai_chat_routes_copilot_requests_per_model() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entrypoint", ["passthrough", "streaming"])
+@pytest.mark.parametrize("entrypoint", ["passthrough", "streaming", "streaming-disconnected"])
 @pytest.mark.parametrize(
     ("path", "expected_auth"),
     [
@@ -85,16 +85,34 @@ async def test_real_forwarders_enforce_credential_and_secret_boundaries(
     )
     content = b'data: {"choices":[{"text":"accepted"}]}\n\ndata: [DONE]\n\n'
 
+    class UpstreamStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield content
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    upstream_stream = UpstreamStream()
+
     def credential_gate(request: httpx.Request) -> httpx.Response:
         admitted = (
             request.headers.get("authorization") == expected_auth
             and request.headers.get("copilot-integration-id") == "vscode"
             and "x-api-key" not in request.headers
         )
+        if admitted:
+            return httpx.Response(
+                200,
+                stream=upstream_stream,
+                headers={"content-type": "text/event-stream"},
+            )
         return httpx.Response(
-            200 if admitted else 401,
-            content=content if admitted else b'{"error":"wrong credential or leaked secret"}',
-            headers={"content-type": "text/event-stream" if admitted else "application/json"},
+            401,
+            content=b'{"error":"wrong credential or leaked secret"}',
+            headers={"content-type": "application/json"},
         )
 
     headers = {
@@ -146,12 +164,15 @@ async def test_real_forwarders_enforce_credential_and_secret_boundaries(
 
             assert response.status_code == 200
             if isinstance(response, StreamingResponse):
-                received = b"".join([chunk async for chunk in response.body_iterator])
+                assert not upstream_stream.closed
+                if entrypoint == "streaming":
+                    received = b"".join([chunk async for chunk in response.body_iterator])
+                    assert received == content
                 if response.background is not None:
                     await response.background()
             else:
-                received = response.body
-            assert received == content
+                assert response.body == content
+            assert upstream_stream.closed
     finally:
         proxy._compression_executor.shutdown()
         proxy._background_compression_executor.shutdown()
