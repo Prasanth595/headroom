@@ -43,6 +43,7 @@ function pluginContextV2(
 ) {
   const tools: Array<Record<string, any>> = [];
   const shellHooks: Array<(input: { env: Record<string, string | undefined> }) => unknown> = [];
+  const toolHooks: Record<string, Array<(input: any) => unknown>> = {};
   const providers = catalog.providers ?? [];
   const models = catalog.models ?? [];
   const context = {
@@ -74,6 +75,10 @@ function pluginContextV2(
         callback({ add: (tool) => tools.push(tool) });
         return { dispose: async () => {} };
       }),
+      hook: vi.fn(async (name: string, callback: (input: any) => unknown) => {
+        (toolHooks[name] ??= []).push(callback);
+        return { dispose: async () => {} };
+      }),
     },
     shell: {
       hook: vi.fn(async (name: string, callback: (input: { env: Record<string, string | undefined> }) => unknown) => {
@@ -83,7 +88,7 @@ function pluginContextV2(
       }),
     },
   };
-  return { context: context as never, tools, shellHooks };
+  return { context: context as never, tools, shellHooks, toolHooks };
 }
 
 function transportState(): { refs: number } | undefined {
@@ -867,6 +872,198 @@ describe("HeadroomPlugin", () => {
 });
 
 describe("headroomSetup (OpenCode 2.x)", () => {
+  it("denies a native tool in execute.before before execution", async () => {
+    const { context, toolHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: {
+        rules: [{ id: "deny-curl", scope: "shell", action: "deny", command: "curl" }],
+      },
+    });
+    const cleanup = await headroomSetup(context);
+
+    expect(toolHooks["execute.before"]).toHaveLength(1);
+    await expect(
+      toolHooks["execute.before"][0]({
+        tool: "bash",
+        sessionID: "session-denied",
+        messageID: "message-denied",
+        id: "call-denied",
+        input: { command: "curl example.test" },
+      }),
+    ).rejects.toThrow(/deny-curl/);
+    await cleanup?.();
+  });
+
+  it("binds and acknowledges a matching allowed native execution", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { context, toolHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const cleanup = await headroomSetup(context);
+    const before = {
+      tool: "bash",
+      sessionID: "session-allowed",
+      messageID: "message-allowed",
+      id: "call-allowed",
+      input: { command: "echo ok", nested: { value: "bound" } },
+    };
+
+    await toolHooks["execute.before"][0](before);
+    expect(() => {
+      before.input.command = "curl example.test";
+    }).toThrow();
+    expect(() => {
+      before.input.nested.value = "mutated";
+    }).toThrow();
+    expect(() => {
+      before.input = { command: "curl example.test", nested: { value: "mutated" } };
+    }).toThrow();
+
+    await toolHooks["execute.after"][0]({
+      ...before,
+      input: { command: "echo ok", nested: { value: "bound" } },
+      status: "completed",
+      result: { content: "ok" },
+    });
+    expect(
+      stderr.mock.calls.some(([value]) => {
+        const output = String(value);
+        return output.includes('"effect":"allowed"') &&
+          output.includes('"taskID":"message-allowed"');
+      }),
+    ).toBe(true);
+    await cleanup?.();
+  });
+
+  it("records a mismatched native completion as unknown", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { context, toolHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const cleanup = await headroomSetup(context);
+    const identity = {
+      tool: "bash",
+      sessionID: "session-mismatch",
+      messageID: "message-mismatch",
+      id: "call-mismatch",
+    };
+
+    await toolHooks["execute.before"][0]({
+      ...identity,
+      input: { command: "echo ok" },
+    });
+    expect(() =>
+      toolHooks["execute.after"][0]({
+        ...identity,
+        input: { command: "curl example.test" },
+        status: "completed",
+        result: { content: "" },
+      }),
+    ).toThrow(/did not match the bound preflight/);
+    expect(
+      stderr.mock.calls.some(([value]) =>
+        String(value).includes('"reason":"postflight_mismatch"'),
+      ),
+    ).toBe(true);
+    await cleanup?.();
+  });
+
+  it("retires pending native calls during cleanup", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { context, toolHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const cleanup = await headroomSetup(context);
+
+    await toolHooks["execute.before"][0]({
+      tool: "bash",
+      sessionID: "session-pending",
+      messageID: "message-pending",
+      id: "call-pending",
+      input: { command: "echo waiting" },
+    });
+    await cleanup?.();
+
+    expect(
+      stderr.mock.calls.some(([value]) =>
+        String(value).includes('"reason":"plugin_disposed"'),
+      ),
+    ).toBe(true);
+  });
+
+  it("records errored native executions as unknown", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { context, toolHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const cleanup = await headroomSetup(context);
+    const identity = {
+      tool: "bash",
+      sessionID: "session-error",
+      messageID: "message-error",
+      id: "call-error",
+      input: { command: "exit 1" },
+    };
+
+    await toolHooks["execute.before"][0](identity);
+    await toolHooks["execute.after"][0]({
+      ...identity,
+      status: "error",
+      error: { name: "ToolError", message: "failed" },
+    });
+
+    expect(
+      stderr.mock.calls.some(([value]) =>
+        String(value).includes('"reason":"postflight_error"'),
+      ),
+    ).toBe(true);
+    await cleanup?.();
+  });
+
+  it("enforces an environment policy and removes its credentials from shells", async () => {
+    vi.stubEnv(
+      "HEADROOM_TOOL_POLICY_JSON",
+      JSON.stringify({
+        rules: [{ id: "deny-write", scope: "tool_call", action: "deny", tool: "write" }],
+      }),
+    );
+    vi.stubEnv("HEADROOM_TOOL_POLICY_TOKEN", "private-token");
+    vi.stubEnv("HEADROOM_TOOL_POLICY_URL", "https://policy.example.test/?token=private");
+    try {
+      const { context, shellHooks, toolHooks } = pluginContextV2({
+        proxyUrl: "http://127.0.0.1:8787",
+      });
+      const cleanup = await headroomSetup(context);
+      const shell = {
+        env: {
+          HEADROOM_TOOL_POLICY_TOKEN: "inherited-token",
+          HEADROOM_TOOL_POLICY_URL: "https://inherited.example.test/",
+        } as Record<string, string | undefined>,
+      };
+
+      await shellHooks[0](shell);
+      expect(shell.env).not.toHaveProperty("HEADROOM_TOOL_POLICY_TOKEN");
+      expect(shell.env).not.toHaveProperty("HEADROOM_TOOL_POLICY_URL");
+      expect(shell.env.HEADROOM_TOOL_POLICY_JSON).toContain("deny-write");
+      await expect(
+        toolHooks["execute.before"][0]({
+          tool: "write",
+          sessionID: "session-environment",
+          messageID: "message-environment",
+          id: "call-environment",
+          input: { path: "secret.txt", value: "data" },
+        }),
+      ).rejects.toThrow(/deny-write/);
+      await cleanup?.();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("registers headroom_retrieve as a direct tool backed by the proxy", async () => {
     const { context, tools } = pluginContextV2({ proxyUrl: "http://127.0.0.1:8787/" });
     const cleanup = await headroomSetup(context);

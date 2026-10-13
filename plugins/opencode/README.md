@@ -585,11 +585,13 @@ The default export is `{ id: "headroom", server, setup }`. OpenCode 1.x calls `s
 
 - install Headroom transport interception for OpenCode provider traffic.
 - expose the `headroom_retrieve` tool (a direct tool on 2.x, not only through code mode).
+- enforce the same bound native-tool preflight and acknowledgement lifecycle.
 - add `HEADROOM_ACTIVE`, `HEADROOM_PROXY_URL`, `HEADROOM_PROJECT` (and `HEADROOM_BACKEND` when set) to shell command environments.
 - default to `HEADROOM_PROXY_URL`, then `http://127.0.0.1:8787`, when no `proxyUrl` option is supplied.
 - skip routing for hosts listed in `excludeHosts` (or `HEADROOM_OPENCODE_EXCLUDE_HOSTS`); those requests go straight upstream with no compression or telemetry.
 
-On 2.x, setup returns a cleanup that releases the transport, so hot reloads do not stack interceptors.
+On 2.x, setup returns a cleanup that retires pending native calls and releases the
+transport, so hot reloads do not leave unresolved policy decisions or stack interceptors.
 
 OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching `fetch` alone does not catch its model traffic. On 2.x the plugin also rewrites each remote model that uses the OpenAI chat-completions or responses format so that it points at the proxy. Headers name the real upstream, as the transport does. Models on other formats (Anthropic messages, Google) are left alone. `headroom wrap opencode` routes native Anthropic and OpenAI through the proxy separately, via their `baseURL`.
 

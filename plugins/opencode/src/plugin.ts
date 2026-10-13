@@ -14,6 +14,7 @@ import type { HeadroomToolPolicyConfig } from "./transport.js";
 import {
   acknowledgeNativeToolExecution,
   acknowledgeUnknownNativeToolExecution,
+  assertNativeToolExecutionBinding,
   enforceNativeToolExecution,
   installHeadroomTransport,
   refreshHeadroomToolPolicy,
@@ -55,6 +56,12 @@ interface PendingPreflight {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface NativeExecutionIdentity {
+  sessionID: string;
+  callID: string;
+  taskID?: string;
+}
+
 function positiveInteger(value: number | undefined, fallback: number): number {
   return Number.isSafeInteger(value) && value! > 0 ? value! : fallback;
 }
@@ -67,6 +74,172 @@ function normalizeProxyUrl(url: string): string {
 
 function retiredCallFingerprint(key: string): string {
   return createHash("sha256").update(key).digest("hex").slice(0, 32);
+}
+
+function nativeCallKey(execution: NativeExecutionIdentity): string {
+  return `${execution.sessionID}\0${execution.callID}`;
+}
+
+function freezeArguments(value: unknown, seen = new Set<object>()): void {
+  if (!value || typeof value !== "object" || seen.has(value)) return;
+  seen.add(value);
+  for (const child of Object.values(value as Record<string, unknown>)) {
+    freezeArguments(child, seen);
+  }
+  Object.freeze(value);
+}
+
+function toolArguments(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return { value };
+}
+
+function createNativeToolLifecycle(
+  projectPath: string,
+  options: HeadroomOpenCodePluginOptions,
+) {
+  const pendingPreflights = new Map<string, PendingPreflight>();
+  const retiredCallFingerprints = new Set<string>();
+  let retiredCallHistoryExhausted = false;
+  const pendingPreflightTtlMs = positiveInteger(
+    options.pendingPreflightTtlMs,
+    DEFAULT_PENDING_PREFLIGHT_TTL_MS,
+  );
+  const maxPendingPreflights = positiveInteger(
+    options.maxPendingPreflights,
+    DEFAULT_MAX_PENDING_PREFLIGHTS,
+  );
+  const maxRetiredCallIdentities = positiveInteger(
+    options.maxRetiredCallIdentities,
+    DEFAULT_MAX_RETIRED_CALL_IDENTITIES,
+  );
+
+  const effectiveCwd = (args: Record<string, unknown>): string => {
+    const configured = typeof args.workdir === "string" ? args.workdir : projectPath;
+    return path.resolve(projectPath, configured);
+  };
+
+  const hasRetiredCallKey = (key: string): boolean =>
+    retiredCallHistoryExhausted ||
+    retiredCallFingerprints.has(retiredCallFingerprint(key));
+
+  const retireCallKey = (key: string): void => {
+    if (retiredCallHistoryExhausted) return;
+    const fingerprint = retiredCallFingerprint(key);
+    if (retiredCallFingerprints.has(fingerprint)) return;
+    if (retiredCallFingerprints.size >= maxRetiredCallIdentities) {
+      retiredCallHistoryExhausted = true;
+      return;
+    }
+    retiredCallFingerprints.add(fingerprint);
+  };
+
+  const finishUnknown = (
+    key: string,
+    reason: NonNullable<Parameters<typeof acknowledgeUnknownNativeToolExecution>[1]>,
+  ): void => {
+    const pending = pendingPreflights.get(key);
+    if (!pending) return;
+    pendingPreflights.delete(key);
+    clearTimeout(pending.timer);
+    retireCallKey(key);
+    acknowledgeUnknownNativeToolExecution(pending.preflight, reason);
+  };
+
+  const rememberPreflight = (
+    key: string,
+    preflight: NonNullable<Awaited<ReturnType<typeof enforceNativeToolExecution>>>,
+  ): void => {
+    finishUnknown(key, "call_replaced");
+    const ambiguous = hasRetiredCallKey(key);
+    while (pendingPreflights.size >= maxPendingPreflights) {
+      const oldestKey = pendingPreflights.keys().next().value as string | undefined;
+      if (oldestKey === undefined) break;
+      finishUnknown(oldestKey, "capacity_evicted");
+    }
+    const timer = setTimeout(
+      () => finishUnknown(key, "postflight_timeout"),
+      pendingPreflightTtlMs,
+    );
+    timer.unref?.();
+    pendingPreflights.set(key, { preflight, ambiguous, timer });
+  };
+
+  return {
+    async before(
+      toolName: string,
+      args: Record<string, unknown>,
+      execution: NativeExecutionIdentity,
+    ): Promise<boolean> {
+      const preflight = await enforceNativeToolExecution(
+        toolName,
+        args,
+        effectiveCwd(args),
+        execution,
+      );
+      if (!preflight) return false;
+      freezeArguments(args);
+      rememberPreflight(nativeCallKey(execution), preflight);
+      return true;
+    },
+    after(
+      toolName: string,
+      args: Record<string, unknown>,
+      execution: NativeExecutionIdentity,
+    ): void {
+      const key = nativeCallKey(execution);
+      const pending = pendingPreflights.get(key);
+      if (!pending) return;
+      if (pending.ambiguous) {
+        finishUnknown(key, "ambiguous_reused_call");
+        return;
+      }
+      try {
+        acknowledgeNativeToolExecution(
+          pending.preflight,
+          toolName,
+          args,
+          effectiveCwd(args),
+          execution,
+        );
+        pendingPreflights.delete(key);
+        clearTimeout(pending.timer);
+        retireCallKey(key);
+      } catch (error) {
+        finishUnknown(key, "postflight_mismatch");
+        throw error;
+      }
+    },
+    afterError(
+      toolName: string,
+      args: Record<string, unknown>,
+      execution: NativeExecutionIdentity,
+    ): void {
+      const key = nativeCallKey(execution);
+      const pending = pendingPreflights.get(key);
+      if (!pending) return;
+      try {
+        assertNativeToolExecutionBinding(
+          pending.preflight,
+          toolName,
+          args,
+          effectiveCwd(args),
+          execution,
+        );
+        finishUnknown(key, "postflight_error");
+      } catch (error) {
+        finishUnknown(key, "postflight_mismatch");
+        throw error;
+      }
+    },
+    dispose(): void {
+      for (const key of [...pendingPreflights.keys()]) {
+        finishUnknown(key, "plugin_disposed");
+      }
+    },
+  };
 }
 
 function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
@@ -199,87 +372,11 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
     sessionToken: resolveSessionToken(pluginOptions),
   });
   await refreshHeadroomToolPolicy();
-  const pendingPreflights = new Map<string, PendingPreflight>();
-  const retiredCallFingerprints = new Set<string>();
-  let retiredCallHistoryExhausted = false;
-  const pendingPreflightTtlMs = positiveInteger(
-    pluginOptions.pendingPreflightTtlMs,
-    DEFAULT_PENDING_PREFLIGHT_TTL_MS,
-  );
-  const maxPendingPreflights = positiveInteger(
-    pluginOptions.maxPendingPreflights,
-    DEFAULT_MAX_PENDING_PREFLIGHTS,
-  );
-  const maxRetiredCallIdentities = positiveInteger(
-    pluginOptions.maxRetiredCallIdentities,
-    DEFAULT_MAX_RETIRED_CALL_IDENTITIES,
-  );
-
-  const hasRetiredCallKey = (key: string): boolean =>
-    retiredCallHistoryExhausted ||
-    retiredCallFingerprints.has(retiredCallFingerprint(key));
-
-  const retireCallKey = (key: string): void => {
-    if (retiredCallHistoryExhausted) return;
-    const fingerprint = retiredCallFingerprint(key);
-    if (retiredCallFingerprints.has(fingerprint)) return;
-    if (retiredCallFingerprints.size >= maxRetiredCallIdentities) {
-      retiredCallHistoryExhausted = true;
-      return;
-    }
-    retiredCallFingerprints.add(fingerprint);
-  };
-
-  const finishUnknown = (
-    key: string,
-    reason: NonNullable<Parameters<typeof acknowledgeUnknownNativeToolExecution>[1]>,
-  ): void => {
-    const pending = pendingPreflights.get(key);
-    if (!pending) return;
-    pendingPreflights.delete(key);
-    clearTimeout(pending.timer);
-    retireCallKey(key);
-    acknowledgeUnknownNativeToolExecution(pending.preflight, reason);
-  };
-
-  const rememberPreflight = (
-    key: string,
-    preflight: NonNullable<Awaited<ReturnType<typeof enforceNativeToolExecution>>>,
-  ): void => {
-    finishUnknown(key, "call_replaced");
-    const ambiguous = hasRetiredCallKey(key);
-    while (pendingPreflights.size >= maxPendingPreflights) {
-      const oldestKey = pendingPreflights.keys().next().value as string | undefined;
-      if (oldestKey === undefined) break;
-      finishUnknown(oldestKey, "capacity_evicted");
-    }
-    const timer = setTimeout(
-      () => finishUnknown(key, "postflight_timeout"),
-      pendingPreflightTtlMs,
-    );
-    timer.unref?.();
-    pendingPreflights.set(key, { preflight, ambiguous, timer });
-  };
-
-  const effectiveCwd = (args: Record<string, unknown>): string => {
-    const configured = typeof args.workdir === "string" ? args.workdir : projectPath;
-    return path.resolve(projectPath, configured);
-  };
-
-  const freezeArguments = (value: unknown, seen = new Set<object>()): void => {
-    if (!value || typeof value !== "object" || seen.has(value)) return;
-    seen.add(value);
-    for (const child of Object.values(value as Record<string, unknown>)) {
-      freezeArguments(child, seen);
-    }
-    Object.freeze(value);
-  };
+  const nativeLifecycle = createNativeToolLifecycle(projectPath, pluginOptions);
 
   return {
     dispose: async () => {
-      for (const key of [...pendingPreflights.keys()]) {
-        finishUnknown(key, "plugin_disposed");
-      }
+      nativeLifecycle.dispose();
       uninstallTransport();
     },
     tool: {
@@ -299,50 +396,23 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
       applyHeadroomShellEnv(output.env, proxyUrl, project, pluginOptions);
     },
     "tool.execute.before": async (hookInput, output) => {
-      const preflight = await enforceNativeToolExecution(
+      const bound = await nativeLifecycle.before(
         hookInput.tool,
         output.args,
-        effectiveCwd(output.args),
         {
           sessionID: hookInput.sessionID,
           callID: hookInput.callID,
         },
       );
-      if (preflight) {
-        freezeArguments(output.args);
+      if (bound) {
         Object.freeze(output);
-        rememberPreflight(
-          `${hookInput.sessionID}\0${hookInput.callID}`,
-          preflight,
-        );
       }
     },
     "tool.execute.after": async (hookInput) => {
-      const key = `${hookInput.sessionID}\0${hookInput.callID}`;
-      const pending = pendingPreflights.get(key);
-      if (!pending) return;
-      if (pending.ambiguous) {
-        finishUnknown(key, "ambiguous_reused_call");
-        return;
-      }
-      try {
-        acknowledgeNativeToolExecution(
-          pending.preflight,
-          hookInput.tool,
-          hookInput.args,
-          effectiveCwd(hookInput.args),
-          {
-            sessionID: hookInput.sessionID,
-            callID: hookInput.callID,
-          },
-        );
-        pendingPreflights.delete(key);
-        clearTimeout(pending.timer);
-        retireCallKey(key);
-      } catch (error) {
-        finishUnknown(key, "postflight_mismatch");
-        throw error;
-      }
+      nativeLifecycle.after(hookInput.tool, hookInput.args, {
+        sessionID: hookInput.sessionID,
+        callID: hookInput.callID,
+      });
     },
   };
 };
@@ -358,6 +428,7 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const excludeHosts = resolveExcludeHosts(pluginOptions);
   const sessionToken = resolveSessionToken(pluginOptions);
+  const nativeLifecycle = createNativeToolLifecycle(ctx.location.directory, pluginOptions);
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
@@ -389,12 +460,43 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
     await ctx.shell.hook("create.before", (shell) => {
       applyHeadroomShellEnv(shell.env, proxyUrl, project, pluginOptions);
     });
+    await ctx.tool.hook("execute.before", async (input) => {
+      const execution = {
+        sessionID: String(input.sessionID),
+        callID: String(input.id),
+        taskID: String(input.messageID),
+      };
+      const bound = await nativeLifecycle.before(
+        input.tool,
+        toolArguments(input.input),
+        execution,
+      );
+      if (bound) Object.freeze(input);
+    });
+    await ctx.tool.hook("execute.after", (input) => {
+      const execution = {
+        sessionID: String(input.sessionID),
+        callID: String(input.id),
+        taskID: String(input.messageID),
+      };
+      if (input.status === "error") {
+        nativeLifecycle.afterError(
+          input.tool,
+          toolArguments(input.input),
+          execution,
+        );
+        return;
+      }
+      nativeLifecycle.after(input.tool, toolArguments(input.input), execution);
+    });
   } catch (error) {
+    nativeLifecycle.dispose();
     uninstallTransport();
     throw error;
   }
 
   return () => {
+    nativeLifecycle.dispose();
     uninstallTransport();
   };
 };

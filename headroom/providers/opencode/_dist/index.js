@@ -13588,7 +13588,7 @@ async function enforceNativeToolExecution(toolName, args, cwd, execution) {
     binding
   );
 }
-function acknowledgeNativeToolExecution(preflight, toolName, args, cwd, execution) {
+function assertNativeToolExecutionBinding(preflight, toolName, args, cwd, execution) {
   const binding = preflight.decision.binding;
   const canonicalArgsHash = hashPolicyResource(stableJson(args));
   if (preflight.decision.authority !== "authoritative" || !binding || binding.caller !== "opencode" || binding.adapter !== "tool.execute.before" || binding.sessionID !== execution.sessionID || binding.callID !== execution.callID || binding.taskID !== (execution.taskID ?? execution.callID) || binding.toolName !== toolName || binding.cwd !== cwd || binding.canonicalArgsHash !== canonicalArgsHash) {
@@ -13596,6 +13596,10 @@ function acknowledgeNativeToolExecution(preflight, toolName, args, cwd, executio
       "[headroom] OpenCode execution acknowledgement did not match the bound preflight decision"
     );
   }
+}
+function acknowledgeNativeToolExecution(preflight, toolName, args, cwd, execution) {
+  assertNativeToolExecutionBinding(preflight, toolName, args, cwd, execution);
+  const binding = preflight.decision.binding;
   const acknowledgement = {
     version: 1,
     event: "headroom_tool_policy_enforcement_acknowledgement",
@@ -14196,6 +14200,139 @@ function normalizeProxyUrl2(url2) {
 function retiredCallFingerprint(key) {
   return createHash2("sha256").update(key).digest("hex").slice(0, 32);
 }
+function nativeCallKey(execution) {
+  return `${execution.sessionID}\0${execution.callID}`;
+}
+function freezeArguments(value, seen = /* @__PURE__ */ new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return;
+  seen.add(value);
+  for (const child of Object.values(value)) {
+    freezeArguments(child, seen);
+  }
+  Object.freeze(value);
+}
+function toolArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+  return { value };
+}
+function createNativeToolLifecycle(projectPath, options) {
+  const pendingPreflights = /* @__PURE__ */ new Map();
+  const retiredCallFingerprints = /* @__PURE__ */ new Set();
+  let retiredCallHistoryExhausted = false;
+  const pendingPreflightTtlMs = positiveInteger(
+    options.pendingPreflightTtlMs,
+    DEFAULT_PENDING_PREFLIGHT_TTL_MS
+  );
+  const maxPendingPreflights = positiveInteger(
+    options.maxPendingPreflights,
+    DEFAULT_MAX_PENDING_PREFLIGHTS
+  );
+  const maxRetiredCallIdentities = positiveInteger(
+    options.maxRetiredCallIdentities,
+    DEFAULT_MAX_RETIRED_CALL_IDENTITIES
+  );
+  const effectiveCwd = (args) => {
+    const configured = typeof args.workdir === "string" ? args.workdir : projectPath;
+    return path2.resolve(projectPath, configured);
+  };
+  const hasRetiredCallKey = (key) => retiredCallHistoryExhausted || retiredCallFingerprints.has(retiredCallFingerprint(key));
+  const retireCallKey = (key) => {
+    if (retiredCallHistoryExhausted) return;
+    const fingerprint = retiredCallFingerprint(key);
+    if (retiredCallFingerprints.has(fingerprint)) return;
+    if (retiredCallFingerprints.size >= maxRetiredCallIdentities) {
+      retiredCallHistoryExhausted = true;
+      return;
+    }
+    retiredCallFingerprints.add(fingerprint);
+  };
+  const finishUnknown = (key, reason) => {
+    const pending = pendingPreflights.get(key);
+    if (!pending) return;
+    pendingPreflights.delete(key);
+    clearTimeout(pending.timer);
+    retireCallKey(key);
+    acknowledgeUnknownNativeToolExecution(pending.preflight, reason);
+  };
+  const rememberPreflight = (key, preflight) => {
+    finishUnknown(key, "call_replaced");
+    const ambiguous = hasRetiredCallKey(key);
+    while (pendingPreflights.size >= maxPendingPreflights) {
+      const oldestKey = pendingPreflights.keys().next().value;
+      if (oldestKey === void 0) break;
+      finishUnknown(oldestKey, "capacity_evicted");
+    }
+    const timer = setTimeout(
+      () => finishUnknown(key, "postflight_timeout"),
+      pendingPreflightTtlMs
+    );
+    timer.unref?.();
+    pendingPreflights.set(key, { preflight, ambiguous, timer });
+  };
+  return {
+    async before(toolName, args, execution) {
+      const preflight = await enforceNativeToolExecution(
+        toolName,
+        args,
+        effectiveCwd(args),
+        execution
+      );
+      if (!preflight) return false;
+      freezeArguments(args);
+      rememberPreflight(nativeCallKey(execution), preflight);
+      return true;
+    },
+    after(toolName, args, execution) {
+      const key = nativeCallKey(execution);
+      const pending = pendingPreflights.get(key);
+      if (!pending) return;
+      if (pending.ambiguous) {
+        finishUnknown(key, "ambiguous_reused_call");
+        return;
+      }
+      try {
+        acknowledgeNativeToolExecution(
+          pending.preflight,
+          toolName,
+          args,
+          effectiveCwd(args),
+          execution
+        );
+        pendingPreflights.delete(key);
+        clearTimeout(pending.timer);
+        retireCallKey(key);
+      } catch (error45) {
+        finishUnknown(key, "postflight_mismatch");
+        throw error45;
+      }
+    },
+    afterError(toolName, args, execution) {
+      const key = nativeCallKey(execution);
+      const pending = pendingPreflights.get(key);
+      if (!pending) return;
+      try {
+        assertNativeToolExecutionBinding(
+          pending.preflight,
+          toolName,
+          args,
+          effectiveCwd(args),
+          execution
+        );
+        finishUnknown(key, "postflight_error");
+      } catch (error45) {
+        finishUnknown(key, "postflight_mismatch");
+        throw error45;
+      }
+    },
+    dispose() {
+      for (const key of [...pendingPreflights.keys()]) {
+        finishUnknown(key, "plugin_disposed");
+      }
+    }
+  };
+}
 function resolveProxyUrl(options) {
   return normalizeProxyUrl2(
     options?.proxyUrl ?? process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? getDefaultProxyUrl()
@@ -14279,72 +14416,10 @@ var HeadroomPlugin = async (input, options = {}) => {
     sessionToken: resolveSessionToken(pluginOptions)
   });
   await refreshHeadroomToolPolicy();
-  const pendingPreflights = /* @__PURE__ */ new Map();
-  const retiredCallFingerprints = /* @__PURE__ */ new Set();
-  let retiredCallHistoryExhausted = false;
-  const pendingPreflightTtlMs = positiveInteger(
-    pluginOptions.pendingPreflightTtlMs,
-    DEFAULT_PENDING_PREFLIGHT_TTL_MS
-  );
-  const maxPendingPreflights = positiveInteger(
-    pluginOptions.maxPendingPreflights,
-    DEFAULT_MAX_PENDING_PREFLIGHTS
-  );
-  const maxRetiredCallIdentities = positiveInteger(
-    pluginOptions.maxRetiredCallIdentities,
-    DEFAULT_MAX_RETIRED_CALL_IDENTITIES
-  );
-  const hasRetiredCallKey = (key) => retiredCallHistoryExhausted || retiredCallFingerprints.has(retiredCallFingerprint(key));
-  const retireCallKey = (key) => {
-    if (retiredCallHistoryExhausted) return;
-    const fingerprint = retiredCallFingerprint(key);
-    if (retiredCallFingerprints.has(fingerprint)) return;
-    if (retiredCallFingerprints.size >= maxRetiredCallIdentities) {
-      retiredCallHistoryExhausted = true;
-      return;
-    }
-    retiredCallFingerprints.add(fingerprint);
-  };
-  const finishUnknown = (key, reason) => {
-    const pending = pendingPreflights.get(key);
-    if (!pending) return;
-    pendingPreflights.delete(key);
-    clearTimeout(pending.timer);
-    retireCallKey(key);
-    acknowledgeUnknownNativeToolExecution(pending.preflight, reason);
-  };
-  const rememberPreflight = (key, preflight) => {
-    finishUnknown(key, "call_replaced");
-    const ambiguous = hasRetiredCallKey(key);
-    while (pendingPreflights.size >= maxPendingPreflights) {
-      const oldestKey = pendingPreflights.keys().next().value;
-      if (oldestKey === void 0) break;
-      finishUnknown(oldestKey, "capacity_evicted");
-    }
-    const timer = setTimeout(
-      () => finishUnknown(key, "postflight_timeout"),
-      pendingPreflightTtlMs
-    );
-    timer.unref?.();
-    pendingPreflights.set(key, { preflight, ambiguous, timer });
-  };
-  const effectiveCwd = (args) => {
-    const configured = typeof args.workdir === "string" ? args.workdir : projectPath;
-    return path2.resolve(projectPath, configured);
-  };
-  const freezeArguments = (value, seen = /* @__PURE__ */ new Set()) => {
-    if (!value || typeof value !== "object" || seen.has(value)) return;
-    seen.add(value);
-    for (const child of Object.values(value)) {
-      freezeArguments(child, seen);
-    }
-    Object.freeze(value);
-  };
+  const nativeLifecycle = createNativeToolLifecycle(projectPath, pluginOptions);
   return {
     dispose: async () => {
-      for (const key of [...pendingPreflights.keys()]) {
-        finishUnknown(key, "plugin_disposed");
-      }
+      nativeLifecycle.dispose();
       uninstallTransport();
     },
     tool: {
@@ -14362,50 +14437,23 @@ var HeadroomPlugin = async (input, options = {}) => {
       applyHeadroomShellEnv(output.env, proxyUrl, project, pluginOptions);
     },
     "tool.execute.before": async (hookInput, output) => {
-      const preflight = await enforceNativeToolExecution(
+      const bound = await nativeLifecycle.before(
         hookInput.tool,
         output.args,
-        effectiveCwd(output.args),
         {
           sessionID: hookInput.sessionID,
           callID: hookInput.callID
         }
       );
-      if (preflight) {
-        freezeArguments(output.args);
+      if (bound) {
         Object.freeze(output);
-        rememberPreflight(
-          `${hookInput.sessionID}\0${hookInput.callID}`,
-          preflight
-        );
       }
     },
     "tool.execute.after": async (hookInput) => {
-      const key = `${hookInput.sessionID}\0${hookInput.callID}`;
-      const pending = pendingPreflights.get(key);
-      if (!pending) return;
-      if (pending.ambiguous) {
-        finishUnknown(key, "ambiguous_reused_call");
-        return;
-      }
-      try {
-        acknowledgeNativeToolExecution(
-          pending.preflight,
-          hookInput.tool,
-          hookInput.args,
-          effectiveCwd(hookInput.args),
-          {
-            sessionID: hookInput.sessionID,
-            callID: hookInput.callID
-          }
-        );
-        pendingPreflights.delete(key);
-        clearTimeout(pending.timer);
-        retireCallKey(key);
-      } catch (error45) {
-        finishUnknown(key, "postflight_mismatch");
-        throw error45;
-      }
+      nativeLifecycle.after(hookInput.tool, hookInput.args, {
+        sessionID: hookInput.sessionID,
+        callID: hookInput.callID
+      });
     }
   };
 };
@@ -14416,6 +14464,7 @@ var headroomSetup = async (ctx) => {
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const excludeHosts = resolveExcludeHosts(pluginOptions);
   const sessionToken = resolveSessionToken(pluginOptions);
+  const nativeLifecycle = createNativeToolLifecycle(ctx.location.directory, pluginOptions);
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
@@ -14446,11 +14495,42 @@ var headroomSetup = async (ctx) => {
     await ctx.shell.hook("create.before", (shell) => {
       applyHeadroomShellEnv(shell.env, proxyUrl, project, pluginOptions);
     });
+    await ctx.tool.hook("execute.before", async (input) => {
+      const execution = {
+        sessionID: String(input.sessionID),
+        callID: String(input.id),
+        taskID: String(input.messageID)
+      };
+      const bound = await nativeLifecycle.before(
+        input.tool,
+        toolArguments(input.input),
+        execution
+      );
+      if (bound) Object.freeze(input);
+    });
+    await ctx.tool.hook("execute.after", (input) => {
+      const execution = {
+        sessionID: String(input.sessionID),
+        callID: String(input.id),
+        taskID: String(input.messageID)
+      };
+      if (input.status === "error") {
+        nativeLifecycle.afterError(
+          input.tool,
+          toolArguments(input.input),
+          execution
+        );
+        return;
+      }
+      nativeLifecycle.after(input.tool, toolArguments(input.input), execution);
+    });
   } catch (error45) {
+    nativeLifecycle.dispose();
     uninstallTransport();
     throw error45;
   }
   return () => {
+    nativeLifecycle.dispose();
     uninstallTransport();
   };
 };

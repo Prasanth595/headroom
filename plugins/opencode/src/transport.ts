@@ -177,6 +177,7 @@ export interface HeadroomToolPolicyAcknowledgement {
   effect: "allowed" | "blocked" | "unknown";
   reason?:
     | "postflight_timeout"
+    | "postflight_error"
     | "postflight_mismatch"
     | "ambiguous_reused_call"
     | "capacity_evicted"
@@ -1509,13 +1510,13 @@ export async function enforceNativeToolExecution(
   );
 }
 
-export function acknowledgeNativeToolExecution(
+export function assertNativeToolExecutionBinding(
   preflight: HeadroomToolPolicyPreflight,
   toolName: string,
   args: Record<string, unknown>,
   cwd: string | undefined,
   execution: { sessionID: string; callID: string; taskID?: string },
-): HeadroomToolPolicyAcknowledgement {
+): void {
   const binding = preflight.decision.binding;
   const canonicalArgsHash = hashPolicyResource(stableJson(args));
   if (
@@ -1534,6 +1535,17 @@ export function acknowledgeNativeToolExecution(
       "[headroom] OpenCode execution acknowledgement did not match the bound preflight decision",
     );
   }
+}
+
+export function acknowledgeNativeToolExecution(
+  preflight: HeadroomToolPolicyPreflight,
+  toolName: string,
+  args: Record<string, unknown>,
+  cwd: string | undefined,
+  execution: { sessionID: string; callID: string; taskID?: string },
+): HeadroomToolPolicyAcknowledgement {
+  assertNativeToolExecutionBinding(preflight, toolName, args, cwd, execution);
+  const binding = preflight.decision.binding!;
   const acknowledgement: HeadroomToolPolicyAcknowledgement = {
     version: 1,
     event: "headroom_tool_policy_enforcement_acknowledgement",
