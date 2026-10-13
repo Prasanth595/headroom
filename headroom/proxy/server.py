@@ -2838,9 +2838,10 @@ def _request_can_view_stats_metadata(
     (the proxy adds the token after its own sign-in). Such a caller reaches
     ``/stats`` with a domain ``Host`` and a peer outside any trusted CIDR, so
     the Host/CIDR rule above can never admit it, and the dashboard's
-    "Recent Requests" table stays empty. A token holder can already use the
-    whole proxy, so showing it these counters widens nothing. Loopback-only
-    endpoints (``/settings``, ``/transformations/feed``) keep their own guards.
+    "Recent Requests" table stays empty. This widens what the token grants:
+    every holder sees the request metadata of every caller on this proxy
+    (docs/content/docs/security-model.mdx, "What the proxy token unlocks").
+    The settings routes and the loopback-only routes keep their own guards.
     """
     if getattr(request.state, "proxy_authenticated", False) is True:
         return True
@@ -5443,7 +5444,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         ``recent_requests`` / ``request_logs`` (per-request ids, providers,
         models, errors) and ``config`` (backend + savings profile) are embedded
-        only for loopback callers — the local dashboard. Network callers still
+        only for callers :func:`_request_can_view_stats_metadata` admits:
+        loopback (the local dashboard), a trusted dashboard CIDR peer, or a
+        caller that passed the proxy token check. Other network callers still
         get the aggregate counters but never the per-request metadata.
         """
         include_sensitive = _request_can_view_stats_metadata(
