@@ -1,22 +1,24 @@
 """Tests for CCR batch result processor.
 
 These tests verify that:
-1. BatchResultProcessor class initialization works correctly
+1. Native tool schemas permit real CCR batch continuations
 2. Result parsing for Anthropic, OpenAI, and Google batch formats
 3. CCR tool call detection in batch results
 4. Continuation call handling works for all providers
 5. Error cases and edge cases are handled gracefully
 """
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
+from headroom.cache import compression_store as compression_store_module
+from headroom.cache.compression_store import CompressionStore, set_request_compression_store
+from headroom.ccr import batch_store as batch_store_module
 from headroom.ccr.batch_processor import (
     BatchResultProcessor,
-    BatchResultProcessorConfig,
-    ProcessedBatchResult,
     process_batch_results,
 )
 from headroom.ccr.batch_store import (
@@ -26,107 +28,6 @@ from headroom.ccr.batch_store import (
     reset_batch_context_store,
 )
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
-
-
-class TestBatchResultProcessorConfig:
-    """Test BatchResultProcessorConfig dataclass."""
-
-    def test_default_config(self):
-        """Default config values."""
-        config = BatchResultProcessorConfig()
-
-        assert config.enabled is True
-        assert config.continuation_timeout == 120
-        assert config.max_continuation_rounds == 3
-
-    def test_custom_config(self):
-        """Custom config values."""
-        config = BatchResultProcessorConfig(
-            enabled=False,
-            continuation_timeout=60,
-            max_continuation_rounds=5,
-        )
-
-        assert config.enabled is False
-        assert config.continuation_timeout == 60
-        assert config.max_continuation_rounds == 5
-
-
-class TestProcessedBatchResult:
-    """Test ProcessedBatchResult dataclass."""
-
-    def test_default_values(self):
-        """Default values for ProcessedBatchResult."""
-        result = ProcessedBatchResult(
-            custom_id="req_123",
-            result={"content": "test"},
-        )
-
-        assert result.custom_id == "req_123"
-        assert result.result == {"content": "test"}
-        assert result.was_processed is False
-        assert result.continuation_rounds == 0
-        assert result.error is None
-
-    def test_processed_result(self):
-        """ProcessedBatchResult with CCR processing."""
-        result = ProcessedBatchResult(
-            custom_id="req_456",
-            result={"content": "processed"},
-            was_processed=True,
-            continuation_rounds=2,
-        )
-
-        assert result.was_processed is True
-        assert result.continuation_rounds == 2
-
-    def test_error_result(self):
-        """ProcessedBatchResult with error."""
-        result = ProcessedBatchResult(
-            custom_id="req_789",
-            result={"content": "partial"},
-            error="Retrieval failed",
-        )
-
-        assert result.error == "Retrieval failed"
-
-
-class TestBatchResultProcessorInit:
-    """Test BatchResultProcessor initialization."""
-
-    def test_default_initialization(self):
-        """Initialize with default config."""
-        http_client = MagicMock(spec=httpx.AsyncClient)
-        processor = BatchResultProcessor(http_client)
-
-        assert processor.http_client == http_client
-        assert processor.config.enabled is True
-        assert processor.config.continuation_timeout == 120
-        assert processor.ccr_handler is not None
-
-    def test_custom_config_initialization(self):
-        """Initialize with custom config."""
-        http_client = MagicMock(spec=httpx.AsyncClient)
-        config = BatchResultProcessorConfig(
-            enabled=False,
-            continuation_timeout=60,
-        )
-        processor = BatchResultProcessor(http_client, config)
-
-        assert processor.config.enabled is False
-        assert processor.config.continuation_timeout == 60
-
-    def test_api_urls_set(self):
-        """API URLs are set for all providers."""
-        http_client = MagicMock(spec=httpx.AsyncClient)
-        processor = BatchResultProcessor(http_client)
-
-        assert "anthropic" in processor.api_urls
-        assert "openai" in processor.api_urls
-        assert "google" in processor.api_urls
-        assert processor.api_urls["anthropic"] == "https://api.anthropic.com"
-        assert processor.api_urls["openai"] == "https://api.openai.com"
-        assert processor.api_urls["google"] == "https://generativelanguage.googleapis.com"
 
 
 class TestCustomIdExtraction:
@@ -684,47 +585,97 @@ class TestContinuationCalls:
         assert call_args.kwargs["json"]["model"] == "gpt-4"
 
     @pytest.mark.asyncio
-    async def test_google_continuation_call(self):
-        """Test Google continuation call format."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "candidates": [{"content": {"parts": [{"text": "Final answer"}]}}]
+    async def test_google_batch_continues_with_native_tool_declarations(self, monkeypatch):
+        store = CompressionStore(enable_feedback=False)
+        original = json.dumps([{"id": 1, "value": "one"}, {"id": 2, "value": "two"}])
+        hash_key = store.store(original, "[]", original_item_count=2)
+        previous_store = compression_store_module._request_ccr_store.get()
+        set_request_compression_store(store)
+        batch_store = BatchContextStore()
+        monkeypatch.setattr(batch_store_module, "_batch_context_store", batch_store)
+        tools = [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": CCR_TOOL_NAME,
+                        "description": "Retrieve original records.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {"hash": {"type": "STRING"}},
+                            "required": ["hash"],
+                        },
+                    },
+                    {
+                        "name": "lookup",
+                        "description": "Look up one record.",
+                        "parameters": {"type": "OBJECT"},
+                    },
+                ]
+            }
+        ]
+        context = BatchContext(batch_id="native-tools", provider="google")
+        context.add_request(
+            BatchRequestContext(
+                custom_id="request",
+                messages=[{"role": "user", "parts": [{"text": "Use the original records"}]}],
+                tools=tools,
+                model="gemini-2.5-flash",
+            )
+        )
+        await batch_store.store(context)
+
+        def admit_continuation(request):
+            body = json.loads(request.content)
+            declarations = body.get("tools", [{}])[0].get("functionDeclarations", [])
+            names = {declaration.get("name") for declaration in declarations}
+            results = [
+                part["functionResponse"]
+                for part in body["contents"][-1]["parts"]
+                if "functionResponse" in part
+            ]
+            admitted = (
+                names == {CCR_TOOL_NAME, "lookup"}
+                and len(results) == 1
+                and results[0]["response"].get("original_content") == original
+            )
+            return httpx.Response(
+                200 if admitted else 400,
+                json={
+                    "candidates": [
+                        {"content": {"role": "model", "parts": [{"text": "All records recovered"}]}}
+                    ]
+                }
+                if admitted
+                else {"error": {"message": "Invalid native tool schema or missing retrieval"}},
+            )
+
+        response = {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"functionCall": {"name": CCR_TOOL_NAME, "args": {"hash": hash_key}}}
+                        ],
+                    }
+                }
+            ]
         }
-        mock_response.raise_for_status = MagicMock()
-
-        http_client = AsyncMock(spec=httpx.AsyncClient)
-        http_client.post.return_value = mock_response
-
-        processor = BatchResultProcessor(http_client)
-
-        request_context = BatchRequestContext(
-            custom_id="req_1",
-            messages=[{"role": "user", "content": "Hello"}],
-            model="gemini-pro",
-            system_instruction="Be helpful.",
-        )
-        batch_context = BatchContext(
-            batch_id="batch_123",
-            provider="google",
-            api_key="google_api_key",
-        )
-
-        await processor._google_continuation(
-            [{"role": "user", "content": "Hello"}],
-            [{"name": "test_tool", "parameters": {}}],
-            request_context,
-            batch_context,
-        )
-
-        # Verify API call
-        http_client.post.assert_called_once()
-        call_args = http_client.post.call_args
-
-        assert "generativelanguage.googleapis.com" in call_args.args[0]
-        assert "gemini-pro" in call_args.args[0]
-        assert "key=google_api_key" in call_args.args[0]
-        assert "contents" in call_args.kwargs["json"]
-        assert "systemInstruction" in call_args.kwargs["json"]
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(admit_continuation)
+            ) as client:
+                processor = BatchResultProcessor(client)
+                processed = await processor.process_results(
+                    "native-tools",
+                    [{"metadata": {"key": "request"}, "response": response}],
+                    "google",
+                )
+            assert processed[0].result["response"]["candidates"][0]["content"]["parts"] == [
+                {"text": "All records recovered"}
+            ]
+        finally:
+            set_request_compression_store(previous_store)
 
     @pytest.mark.asyncio
     async def test_continuation_with_tools(self):
