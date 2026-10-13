@@ -1073,14 +1073,14 @@ def _api_url_from_payload(payload: dict[str, Any] | None) -> str | None:
 #: advertises for them instead of the generic public host.
 USE_ADVERTISED_HOST_ENV = "GITHUB_COPILOT_USE_ADVERTISED_HOST"
 
-#: Per-plan chat hosts GitHub advertises in ``endpoints.api``. The generic host
-#: serves all of them, and it is the one Headroom routes to by default: the
-#: segmented hosts regressed model availability for wrapped sessions (#610 for
-#: individual, #2441 for Business/Enterprise) and the official client's results
-#: could not be reproduced through them at the time. Enterprises whose firewall
-#: uses GitHub's subscription-based network routing block the generic host, so
-#: they need the advertised host — hence the opt-in above and the explicit
-#: ``GITHUB_COPILOT_API_URL`` pin.
+#: Per-plan chat hosts GitHub advertises in ``endpoints.api`` for Business and
+#: Enterprise seats. Headroom honours them by default: it is the host GitHub's
+#: own clients route with, and enterprises whose firewall uses GitHub's
+#: subscription-based network routing block the generic host entirely. The
+#: opt-out above (``GITHUB_COPILOT_USE_ADVERTISED_HOST=0``) folds them back into
+#: the generic host for accounts where the segmented host still lags on model
+#: availability (#2441 reported that for Claude models in 2026-05); an explicit
+#: ``GITHUB_COPILOT_API_URL`` pin wins over both.
 _SEGMENTED_PLAN_HOSTS: frozenset[str] = frozenset(
     {
         "api.business.githubcopilot.com",
@@ -1090,9 +1090,9 @@ _SEGMENTED_PLAN_HOSTS: frozenset[str] = frozenset(
 
 
 def use_advertised_host() -> bool:
-    """Return True when the operator opted into GitHub's advertised per-plan host."""
+    """Return True unless the operator opted out of GitHub's advertised per-plan host."""
     value = os.environ.get(USE_ADVERTISED_HOST_ENV, "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
+    return value not in {"0", "false", "no", "off"}
 
 
 def advertised_host_is_normalized(api_url: str | None) -> bool:

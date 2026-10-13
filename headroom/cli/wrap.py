@@ -4729,8 +4729,9 @@ def _echo_copilot_host_notice(resolution: CopilotSubscriptionTokenResolution | N
     """Tell the user when GitHub advertised a per-plan host Headroom is not using.
 
     Business and Enterprise tokens come with ``api.business.`` /
-    ``api.enterprise.githubcopilot.com``; Headroom routes to the generic host by
-    default (see ``copilot_auth._SEGMENTED_PLAN_HOSTS``). Networks that use
+    ``api.enterprise.githubcopilot.com`` and Headroom honours them by default.
+    With ``GITHUB_COPILOT_USE_ADVERTISED_HOST=0`` it folds them into the generic
+    host instead (see ``copilot_auth._SEGMENTED_PLAN_HOSTS``). Networks that use
     GitHub's subscription-based routing block the generic host, and that
     failure surfaces only as connection errors inside the agent, so say it here.
     """
@@ -4739,8 +4740,9 @@ def _echo_copilot_host_notice(resolution: CopilotSubscriptionTokenResolution | N
         return
     click.echo(
         f"  Note: GitHub advertised {advertised} for this account; Headroom routes via "
-        f"{resolution.api_url}. If your network uses subscription-based routing, set "
-        f"{_USE_ADVERTISED_HOST_ENV}=1 or GITHUB_COPILOT_API_URL={advertised}."
+        f"{resolution.api_url} because {_USE_ADVERTISED_HOST_ENV} is disabled. Unset it "
+        f"(or set GITHUB_COPILOT_API_URL={advertised}) if your network uses "
+        "subscription-based routing."
     )
 
 

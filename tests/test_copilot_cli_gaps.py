@@ -394,23 +394,28 @@ def test_ghe_host_from_a_token_exchange_is_honoured() -> None:
     "advertised",
     ["https://api.business.githubcopilot.com", "https://api.enterprise.githubcopilot.com"],
 )
-def test_segmented_plan_hosts_normalize_by_default_and_honour_the_opt_in(
+def test_segmented_plan_hosts_are_honoured_by_default_and_normalized_on_opt_out(
     monkeypatch: pytest.MonkeyPatch, advertised: str
 ) -> None:
     payload = {"endpoints": {"api": advertised}}
+    assert copilot_auth._subscription_api_url_from_user_info_payload(payload) == advertised
+    assert copilot_auth.advertised_host_is_normalized(advertised) is False
+
+    monkeypatch.setenv(copilot_auth.USE_ADVERTISED_HOST_ENV, "0")
     assert (
         copilot_auth._subscription_api_url_from_user_info_payload(payload)
         == copilot_auth.DEFAULT_API_URL
     )
     assert copilot_auth.advertised_host_is_normalized(advertised) is True
 
-    monkeypatch.setenv(copilot_auth.USE_ADVERTISED_HOST_ENV, "1")
-    assert copilot_auth._subscription_api_url_from_user_info_payload(payload) == advertised
-    assert copilot_auth.advertised_host_is_normalized(advertised) is False
+
+@pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
+def test_opt_out_spellings(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv(copilot_auth.USE_ADVERTISED_HOST_ENV, value)
+    assert copilot_auth.use_advertised_host() is False
 
 
-def test_explicit_pin_still_beats_the_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(copilot_auth.USE_ADVERTISED_HOST_ENV, "1")
+def test_explicit_pin_still_beats_the_advertised_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://egress.corp.example")
     assert (
         copilot_auth._subscription_api_url_from_user_info_payload(
@@ -420,11 +425,9 @@ def test_explicit_pin_still_beats_the_opt_in(monkeypatch: pytest.MonkeyPatch) ->
     )
 
 
-def test_individual_host_stays_normalized_even_with_the_opt_in(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_individual_host_stays_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
     """#610: the individual segmented host did not serve newer models."""
-    monkeypatch.setenv(copilot_auth.USE_ADVERTISED_HOST_ENV, "true")
+    monkeypatch.delenv(copilot_auth.USE_ADVERTISED_HOST_ENV, raising=False)
     assert (
         copilot_auth._subscription_api_url_from_user_info_payload(
             {"endpoints": {"api": "https://api.individual.githubcopilot.com"}}
@@ -462,14 +465,17 @@ def test_resolution_records_the_advertised_host(monkeypatch: pytest.MonkeyPatch)
     resolution = copilot_auth.resolve_subscription_bearer_token_details()
 
     assert resolution is not None
-    assert resolution.api_url == copilot_auth.DEFAULT_API_URL
+    assert resolution.api_url == "https://api.business.githubcopilot.com"
     assert resolution.advertised_api_url == "https://api.business.githubcopilot.com"
 
 
-def test_wrap_prints_the_advertised_host_notice(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wrap_prints_the_advertised_host_notice_when_opted_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from headroom.cli import wrap as wrap_mod
     from headroom.cli.main import main
 
+    monkeypatch.setenv(copilot_auth.USE_ADVERTISED_HOST_ENV, "0")
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/copilot")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
     monkeypatch.setattr(
@@ -589,6 +595,7 @@ def test_subscription_lane_drops_a_durable_installs_native_hook_and_prints_the_n
 
     captured: dict[str, object] = {}
     monkeypatch.setenv(COPILOT_NATIVE_API_URL_ENV, "http://127.0.0.1:9999")
+    monkeypatch.setenv(copilot_auth.USE_ADVERTISED_HOST_ENV, "0")  # the notice fires on opt-out
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/copilot")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
     monkeypatch.setattr(

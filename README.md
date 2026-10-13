@@ -293,13 +293,12 @@ export GITHUB_COPILOT_ENTERPRISE_URL=https://ghe.example.com
 ```
 
 Business and Enterprise accounts are advertised a per-plan host
-(`api.business.githubcopilot.com` / `api.enterprise.githubcopilot.com`). Headroom
-routes them through the generic host by default; `--subscription`, `--native`
-and `wrap vscode` print the advertised host at launch when they override it. If
-your network uses GitHub's subscription-based network routing,
-which blocks the generic host, set `GITHUB_COPILOT_USE_ADVERTISED_HOST=1` or pin
-`GITHUB_COPILOT_API_URL` to the advertised host. Data-residency hosts
-(`copilot-api.<tenant>.ghe.com`) are always honored.
+(`api.business.githubcopilot.com` / `api.enterprise.githubcopilot.com`), and
+Headroom routes through it, the same as GitHub's own clients. If that host
+rejects a model your seat should have, set
+`GITHUB_COPILOT_USE_ADVERTISED_HOST=0` to route through the generic
+`api.githubcopilot.com` instead, or pin `GITHUB_COPILOT_API_URL` explicitly.
+Data-residency hosts (`copilot-api.<tenant>.ghe.com`) are always honored.
 
 `headroom wrap copilot` refuses to launch when `~/.copilot/settings.json` (or
 `$COPILOT_HOME`) pins a different `copilotUrl`: the CLI ranks that setting above

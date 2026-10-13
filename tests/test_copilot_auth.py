@@ -541,7 +541,8 @@ def test_subscription_enterprise_host_repro(
     assert resolution.token == "copilot-api"
     assert resolution.source == "headroom-copilot-auth:/tmp/copilot_auth.json:token-exchange"
     assert resolution.confidence == "copilot-token-exchange"
-    assert resolution.api_url == copilot_auth.DEFAULT_API_URL
+    assert resolution.api_url == "https://api.enterprise.githubcopilot.com"
+    assert resolution.advertised_api_url == "https://api.enterprise.githubcopilot.com"
     assert resolution.token_fingerprint == copilot_auth.token_fingerprint("copilot-api")
     assert resolution.refresh_oauth_token == "gho-oauth"
     assert isinstance(resolution.api_token_expires_at, float)
@@ -589,7 +590,7 @@ def test_resolve_subscription_exchange_uses_cloud_enterprise_advertised_api(
     resolution = copilot_auth.resolve_subscription_bearer_token_details()
 
     assert resolution is not None
-    assert resolution.api_url == copilot_auth.DEFAULT_API_URL
+    assert resolution.api_url == "https://api.enterprise.githubcopilot.com"
     assert copilot_auth._token_exchange_url() == "https://api.github.com/copilot_internal/v2/token"
 
 
@@ -610,7 +611,8 @@ def test_api_url_from_exchange_payload_rejects_non_copilot_host(
         oauth_token="gho-oauth",
     )
 
-    assert resolved == copilot_auth.DEFAULT_API_URL
+    # The foreign host is dropped; routing falls back to the host user-info advertises.
+    assert resolved == "https://api.business.githubcopilot.com"
 
 
 def _resolve_subscription_producer_path(
@@ -718,8 +720,6 @@ def test_subscription_unknown_host_passthrough(monkeypatch: pytest.MonkeyPatch) 
     [
         "https://api.githubcopilot.com",
         "https://api.individual.githubcopilot.com",
-        "https://api.business.githubcopilot.com",
-        "https://api.enterprise.githubcopilot.com",
     ],
 )
 def test_subscription_known_hosts_normalize_to_default(payload_host: str) -> None:
@@ -727,6 +727,27 @@ def test_subscription_known_hosts_normalize_to_default(payload_host: str) -> Non
         copilot_auth._subscription_api_url_from_user_info_payload(
             {"endpoints": {"api": payload_host}}
         )
+        == copilot_auth.DEFAULT_API_URL
+    )
+
+
+@pytest.mark.parametrize(
+    "payload_host",
+    [
+        "https://api.business.githubcopilot.com",
+        "https://api.enterprise.githubcopilot.com",
+    ],
+)
+def test_subscription_plan_hosts_are_honoured_unless_opted_out(
+    monkeypatch: pytest.MonkeyPatch, payload_host: str
+) -> None:
+    monkeypatch.delenv(copilot_auth.USE_ADVERTISED_HOST_ENV, raising=False)
+    payload = {"endpoints": {"api": payload_host}}
+    assert copilot_auth._subscription_api_url_from_user_info_payload(payload) == payload_host
+
+    monkeypatch.setenv(copilot_auth.USE_ADVERTISED_HOST_ENV, "0")
+    assert (
+        copilot_auth._subscription_api_url_from_user_info_payload(payload)
         == copilot_auth.DEFAULT_API_URL
     )
 
