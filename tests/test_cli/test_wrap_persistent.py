@@ -2102,6 +2102,8 @@ def test_ensure_proxy_unseeded_session_diverts_from_seeded_persistent_deployment
     assert calls[0] == ("find_port", 8787)
     assert calls[1][0] == "start"
     assert not calls[1][2].get("copilot_refresh_oauth_token")
+
+
 def _dedicated_start(monkeypatch, *, health, manifest=None):
     """Drive a Copilot-seeded wrap that must start a dedicated proxy beside port 8787."""
     calls: list[object] = []
