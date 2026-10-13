@@ -145,6 +145,15 @@ def test_resolver_tier4_env_block_cwd_format() -> None:
     assert display == "cwd-style"
 
 
+def test_resolver_tier4_env_block_bulleted_cwd_format() -> None:
+    r = ProjectResolver()
+    prompt = "- cwd: /Users/foo/code/bulleted-cwd\n"
+    out = r.resolve(_ctx(system_prompt=prompt))
+    assert out is not None
+    _, display = out
+    assert display == "bulleted-cwd"
+
+
 def test_resolver_ignores_incidental_cwd_prose() -> None:
     r = ProjectResolver()
     assert (
