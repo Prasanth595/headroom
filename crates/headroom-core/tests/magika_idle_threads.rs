@@ -4,6 +4,7 @@
 //! core count pegs idle CPUs in a long-lived proxy. The magika session is a
 //! process-global singleton and the assertion counts OS threads, so this file
 //! holds exactly ONE `#[test]` fn and must run in its own process.
+#![cfg(all(feature = "ml", any(target_os = "linux", target_os = "macos")))]
 
 use std::time::Duration;
 
@@ -26,13 +27,16 @@ fn os_thread_count() -> usize {
     String::from_utf8_lossy(&out.stdout).lines().count() - 1
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn magika_session_does_not_spawn_intra_op_pool() {
     let before = os_thread_count();
     match magika_detect("fn main() { println!(\"hi\"); }") {
         Ok(_) => {}
-        Err(MagikaDetectorError::Init(reason)) => {
+        // With an explicit ORT_DYLIB_PATH (as in CI) the runtime is present,
+        // so an init failure is a real session-build regression, not a skip.
+        Err(MagikaDetectorError::Init(reason))
+            if std::env::var("ORT_DYLIB_PATH").map_or(true, |v| v.trim().is_empty()) =>
+        {
             eprintln!("skipping: magika runtime unavailable on this host: {reason}");
             return;
         }
@@ -41,9 +45,10 @@ fn magika_session_does_not_spawn_intra_op_pool() {
     // Let the short-lived `magika-init` thread finish exiting.
     std::thread::sleep(Duration::from_millis(200));
     let after = os_thread_count();
-    // ORT always starts one blocked telemetry worker, and macOS may add a
-    // libdispatch worker; neither spins. The pool this guards against adds
-    // one thread per extra core (9 on a 16-core host).
+    // ORT and macOS may leave up to 2 idle background threads (ORT telemetry,
+    // libdispatch); neither spins. A pool adds its workers on top (7 on a
+    // 16-core Mac), but on very small hosts a 1-2 worker pool can hide inside
+    // this allowance, so a pass there is not proof of no spinning.
     let extra = after.saturating_sub(before);
     assert!(
         extra <= 2,
