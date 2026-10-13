@@ -872,6 +872,26 @@ describe("HeadroomPlugin", () => {
 });
 
 describe("headroomSetup (OpenCode 2.x)", () => {
+  it("uses the process directory when the live runtime omits location and model", async () => {
+    const { context, shellHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const runtimeContext = context as unknown as {
+      location?: unknown;
+      model?: unknown;
+    };
+    runtimeContext.location = undefined;
+    runtimeContext.model = undefined;
+
+    const cleanup = await headroomSetup(context);
+    const shell = { env: {} as Record<string, string | undefined> };
+    await shellHooks[0](shell);
+
+    expect(shell.env.HEADROOM_PROJECT).toBe(process.cwd());
+    await cleanup?.();
+  });
+
   it("denies a native tool in execute.before before execution", async () => {
     const { context, toolHooks } = pluginContextV2({
       proxyUrl: "http://127.0.0.1:8787",

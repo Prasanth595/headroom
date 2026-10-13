@@ -14458,17 +14458,19 @@ var HeadroomPlugin = async (input, options = {}) => {
   };
 };
 var headroomSetup = async (ctx) => {
+  const runtimeCtx = ctx;
   const pluginOptions = ctx.options;
   const proxyUrl = resolveProxyUrl(pluginOptions);
-  const project = pluginOptions.project ?? ctx.location.project.id ?? ctx.location.directory;
+  const projectPath = runtimeCtx.location?.directory ?? process.cwd();
+  const project = pluginOptions.project ?? runtimeCtx.location?.project?.id ?? projectPath;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const excludeHosts = resolveExcludeHosts(pluginOptions);
   const sessionToken = resolveSessionToken(pluginOptions);
-  const nativeLifecycle = createNativeToolLifecycle(ctx.location.directory, pluginOptions);
+  const nativeLifecycle = createNativeToolLifecycle(projectPath, pluginOptions);
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
-    policyProject: ctx.location.directory,
+    policyProject: projectPath,
     excludeHosts,
     debug: pluginOptions.debug,
     toolPolicy: pluginOptions.toolPolicy,
@@ -14476,9 +14478,11 @@ var headroomSetup = async (ctx) => {
   });
   try {
     await refreshHeadroomToolPolicy();
-    await ctx.model.transform((models) => {
-      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
-    });
+    if (runtimeCtx.model) {
+      await runtimeCtx.model.transform((models) => {
+        routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
+      });
+    }
     await ctx.tool.transform((editor) => {
       editor.add({
         name: retrieveTool.name,

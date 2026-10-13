@@ -421,18 +421,26 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
 // OpenCode reruns setup (after cleanup) whenever it hot-reloads the plugin;
 // the transport is refcounted, so reinstalling is safe.
 export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
+  const runtimeCtx = ctx as unknown as {
+    location?: {
+      directory?: string;
+      project?: { id?: string };
+    };
+    model?: PluginV2.Context["model"];
+  };
   const pluginOptions = ctx.options as HeadroomOpenCodePluginOptions;
   const proxyUrl = resolveProxyUrl(pluginOptions);
+  const projectPath = runtimeCtx.location?.directory ?? process.cwd();
   const project =
-    pluginOptions.project ?? ctx.location.project.id ?? ctx.location.directory;
+    pluginOptions.project ?? runtimeCtx.location?.project?.id ?? projectPath;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const excludeHosts = resolveExcludeHosts(pluginOptions);
   const sessionToken = resolveSessionToken(pluginOptions);
-  const nativeLifecycle = createNativeToolLifecycle(ctx.location.directory, pluginOptions);
+  const nativeLifecycle = createNativeToolLifecycle(projectPath, pluginOptions);
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
-    policyProject: ctx.location.directory,
+    policyProject: projectPath,
     excludeHosts,
     debug: pluginOptions.debug,
     toolPolicy: pluginOptions.toolPolicy,
@@ -441,9 +449,11 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
 
   try {
     await refreshHeadroomToolPolicy();
-    await ctx.model.transform((models) => {
-      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
-    });
+    if (runtimeCtx.model) {
+      await runtimeCtx.model.transform((models) => {
+        routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
+      });
+    }
     await ctx.tool.transform((editor) => {
       editor.add({
         name: retrieveTool.name,
