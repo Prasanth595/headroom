@@ -69,6 +69,7 @@ from headroom.config import is_tool_excluded, unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
     build_copilot_upstream_url,
+    copilot_bearer_upstream,
     is_copilot_api_url,
 )
 from headroom.pipeline import PipelineStage, summarize_routing_markers
@@ -476,6 +477,36 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
         logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
         return None
     return normalized
+
+
+def _copilot_redirect_base_url(
+    request_headers: Any, custom_base_url: str | None, configured_target: str
+) -> str | None:
+    """Return the Copilot base a request is redirected to, or None.
+
+    Single source of the rule shared by :meth:`OpenAIHandlerMixin._resolve_openai_upstream`
+    and the chat / responses handlers: an explicit ``x-headroom-base-url`` always
+    wins, otherwise a Copilot credential headed for the stock OpenAI host is sent
+    to Copilot (see :func:`copilot_bearer_upstream`).
+    """
+    if custom_base_url:
+        return None
+    return copilot_bearer_upstream(request_headers, configured_target)
+
+
+def _extra_headers_unless_redirected(
+    extra: dict[str, str] | None, *, redirected_to: str | None
+) -> dict[str, str] | None:
+    """Withhold operator gateway headers from a Copilot-redirected request.
+
+    ``openai_extra_headers`` are secrets configured for the operator's OpenAI
+    target. When a Copilot credential causes the request to be redirected to
+    GitHub instead (``redirected_to`` is set), that target is not where the
+    request goes, so the headers must not travel with it — and, unlike routing
+    the merge through the trust check, this raises no "untrusted upstream"
+    warning for a redirect the proxy chose deliberately.
+    """
+    return None if redirected_to else extra
 
 
 def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
@@ -1909,9 +1940,14 @@ class OpenAIHandlerMixin:
         Otherwise falls back to the configured ``OPENAI_API_URL``
         (``OPENAI_TARGET_API_URL``).
         """
-        custom = _resolve_openai_upstream_base(request.headers)
-        if custom is not None:
-            return custom
+        custom_base_url = _resolve_openai_upstream_base(request.headers)
+        if custom_base_url is not None:
+            return custom_base_url
+        copilot_base_url = _copilot_redirect_base_url(
+            request.headers, custom_base_url, self.OPENAI_API_URL
+        )
+        if copilot_base_url is not None:
+            return copilot_base_url
         if route_grok_to_xai(request.headers, self.OPENAI_API_URL):
             return XAI_API_URL
         return self.OPENAI_API_URL
@@ -3144,6 +3180,13 @@ class OpenAIHandlerMixin:
             messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
         )
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        # A Copilot credential headed for the stock OpenAI host is redirected to
+        # Copilot (see `copilot_bearer_upstream`). Track the redirect separately
+        # from the operator-configured target: it decides both the destination
+        # and whether the operator's gateway headers may travel with the request.
+        copilot_redirect_base_url = _copilot_redirect_base_url(
+            request.headers, custom_upstream_base_url, self.OPENAI_API_URL
+        )
         upstream_base_url = self._resolve_openai_upstream(request)
         handler_path_suffix = _resolve_openai_chat_handler_path(
             upstream_base_url,
@@ -3281,9 +3324,12 @@ class OpenAIHandlerMixin:
         # receiving those extras.
         headers = merge_extra_headers(
             headers,
-            self.config.openai_extra_headers
-            if self.anthropic_backend is not None
-            else self._openai_extra_headers_for_upstream(upstream_base_url),
+            _extra_headers_unless_redirected(
+                self.config.openai_extra_headers
+                if self.anthropic_backend is not None
+                else self._openai_extra_headers_for_upstream(upstream_base_url),
+                redirected_to=copilot_redirect_base_url,
+            ),
             upstream_url=(None if self.anthropic_backend is not None else custom_upstream_base_url),
             config=self.config,
         )
@@ -5620,10 +5666,16 @@ class OpenAIHandlerMixin:
         # below sends the request to chatgpt.com.
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = custom_upstream_base_url
+        copilot_redirect_base_url = _copilot_redirect_base_url(
+            request.headers, custom_upstream_base_url, self.OPENAI_API_URL
+        )
         openai_upstream_base_url = self._resolve_openai_upstream(request)
         headers = merge_extra_headers(
             headers,
-            self._openai_extra_headers_for_upstream(openai_upstream_base_url),
+            _extra_headers_unless_redirected(
+                self._openai_extra_headers_for_upstream(openai_upstream_base_url),
+                redirected_to=copilot_redirect_base_url,
+            ),
             upstream_url=custom_upstream_base_url,
             config=self.config,
         )

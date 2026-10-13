@@ -499,6 +499,19 @@ def sample_request_metrics():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_copilot_cli_home(monkeypatch, tmp_path):
+    """Keep the developer's real ``~/.copilot`` out of every test.
+
+    ``headroom wrap copilot`` now reads the Copilot CLI's ``settings.json`` for a
+    ``copilotUrl`` pin and refuses to launch a session that pin would bypass. A
+    developer who has such a pin (for example from a durable Headroom install on
+    another port) would otherwise fail unrelated wrap tests on their machine.
+    Tests that exercise the check set ``COPILOT_HOME`` themselves.
+    """
+    monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_kompress_model_cache():
     """Keep one test's loaded Kompress model out of every later test's ``/readyz``.
 
