@@ -175,15 +175,20 @@ def test_resolver_unencodable_cli_override_falls_through_to_system_prompt() -> N
     assert display == "headroom"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX undecodable byte filenames and symlinks only")
 def test_resolver_symlink_to_undecodable_name_does_not_raise(tmp_path: Path) -> None:
     # The cwd itself is plain UTF-8, but realpath follows the symlink to a
     # non-UTF-8 filename and returns it as a ``\udcXX`` surrogate escape.
+    # Creating that fixture is a filesystem capability, not product behavior:
+    # skip if it is unavailable (e.g. macOS APFS rejects non-UTF-8 names).
+    # test_resolver_realpath_returning_surrogate_does_not_raise covers the
+    # same path on every platform.
     base = os.fsencode(tmp_path)
     try:
         os.mkdir(base + b"/\xff-target")
-    except OSError:
-        pytest.skip("filesystem rejects non-UTF-8 filenames (e.g. macOS APFS)")
-    os.symlink(base + b"/\xff-target", base + b"/link")
+        os.symlink(base + b"/\xff-target", base + b"/link")
+    except (OSError, UnicodeError) as exc:
+        pytest.skip(f"cannot create a non-UTF-8 symlink fixture here: {exc}")
     prompt = f"Primary working directory: {tmp_path}/link\n"
     assert ProjectResolver().resolve(_ctx(system_prompt=prompt)) is None
 
