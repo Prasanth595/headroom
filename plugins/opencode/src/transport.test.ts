@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  activateHeadroomRepositoryPolicy,
   acknowledgeNativeToolExecution,
   enforceNativeToolExecution,
   evaluateNativeToolPolicy,
@@ -1300,6 +1301,7 @@ describe("Headroom OpenCode transport", () => {
       const disposeParent = installHeadroomTransport({
         proxyUrl: "http://127.0.0.1:8787",
       });
+
       childProcess.spawn("node", ["agent.js"]);
       const childEnv = (spawnMock.mock.calls[0] as unknown[])[2] as {
         env: NodeJS.ProcessEnv;
@@ -1330,6 +1332,61 @@ describe("Headroom OpenCode transport", () => {
       else process.env.HEADROOM_TOOL_POLICY_URL = previousUrl;
       if (previousToken === undefined) delete process.env.HEADROOM_TOOL_POLICY_TOKEN;
       else process.env.HEADROOM_TOOL_POLICY_TOKEN = previousToken;
+    }
+  });
+
+  it("clears startup repository policy for a policy-free session repository", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-transition-"));
+    const startupRepo = path.join(root, "startup");
+    const sessionRepo = path.join(root, "session");
+    const previousConfigDir = process.env.HEADROOM_CONFIG_DIR;
+    fs.mkdirSync(path.join(startupRepo, ".headroom"), { recursive: true });
+    fs.mkdirSync(sessionRepo);
+    process.env.HEADROOM_CONFIG_DIR = path.join(root, "empty-global-config");
+    fs.writeFileSync(
+      path.join(startupRepo, ".headroom", "tool_policy.json"),
+      JSON.stringify({
+        rules: [
+          {
+            id: "deny-startup-curl",
+            scope: "shell",
+            action: "deny",
+            command: "curl",
+          },
+        ],
+      }),
+    );
+
+    try {
+      installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787",
+        policyProject: startupRepo,
+      });
+      await expect(
+        enforceNativeToolExecution(
+          "shell",
+          { command: "curl example.test" },
+          startupRepo,
+          { sessionID: "startup", callID: "startup-call" },
+        ),
+      ).rejects.toThrow(/deny-startup-curl/);
+
+      activateHeadroomRepositoryPolicy(sessionRepo);
+
+      await expect(
+        enforceNativeToolExecution(
+          "shell",
+          { command: "curl example.test" },
+          sessionRepo,
+          { sessionID: "session", callID: "session-call" },
+        ),
+      ).resolves.toBeUndefined();
+      expect(process.env.HEADROOM_TOOL_POLICY_JSON).toBeUndefined();
+    } finally {
+      uninstallHeadroomTransport();
+      if (previousConfigDir === undefined) delete process.env.HEADROOM_CONFIG_DIR;
+      else process.env.HEADROOM_CONFIG_DIR = previousConfigDir;
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

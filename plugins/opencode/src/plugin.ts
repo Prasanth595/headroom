@@ -616,7 +616,7 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
       registrations.push(await runtimeCtx.session.hook("model.request", async (input) => {
         const directory = await sessionProjectPath(String(input.sessionID));
         activateHeadroomRepositoryPolicy(directory);
-        input.headers[PROJECT_HEADER] = pluginOptions.project ?? directory;
+        input.headers[PROJECT_HEADER] = project;
       }));
     } else if (!runtimeCtx.location?.directory) {
       throw new Error(

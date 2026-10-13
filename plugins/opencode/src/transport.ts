@@ -817,11 +817,14 @@ export function activateHeadroomRepositoryPolicy(policyProject: string): void {
     state,
   );
   try {
-    state.toolPolicy = compileToolPolicy(
-      selectedSource.input,
-      resolvedProject,
-      selectedSource.source,
-    );
+    state.toolPolicy =
+      selectedSource.source === "unconfigured"
+        ? undefined
+        : compileToolPolicy(
+            selectedSource.input,
+            resolvedProject,
+            selectedSource.source,
+          );
     if (state.toolPolicy && selectedSource.validUntil !== undefined) {
       state.toolPolicy.validUntil = selectedSource.validUntil;
     }

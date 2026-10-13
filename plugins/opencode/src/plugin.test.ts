@@ -946,8 +946,29 @@ describe("headroomSetup (OpenCode 2.x)", () => {
     const shell = { env: {} as Record<string, string | undefined> };
     await shellHooks[0](shell);
 
-    expect(modelRequest.headers["x-headroom-project"]).toBe(path.resolve("/repo"));
+    expect(modelRequest.headers["x-headroom-project"]).toBe(process.cwd());
     expect(shell.env.HEADROOM_PROJECT).toBe(process.cwd());
+    await cleanup?.();
+  });
+
+  it("preserves the configured project label on model requests", async () => {
+    const { context, sessionHooks } = pluginContextV2({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const cleanup = await headroomSetup(context);
+    const modelRequest = {
+      sessionID: "session-project-label",
+      headers: {} as Record<string, string>,
+    };
+
+    await sessionHooks["model.request"][0](modelRequest);
+
+    expect(modelRequest.headers["x-headroom-project"]).toBe("project-1");
+    expect(
+      (context as unknown as { session: { get: ReturnType<typeof vi.fn> } })
+        .session.get,
+    ).not.toHaveBeenCalled();
     await cleanup?.();
   });
 
