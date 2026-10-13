@@ -18,6 +18,24 @@ from headroom.transforms.content_router import (
 )
 
 
+def test_cached_ccr_store_failure_does_not_log_sensitive_details(monkeypatch, caplog):
+    from headroom.cache import compression_store
+
+    def exists(hash_key):
+        raise RuntimeError("PRIVATE_CREDENTIAL_CANARY")
+
+    monkeypatch.setattr(
+        compression_store, "get_compression_store", lambda: SimpleNamespace(exists=exists)
+    )
+    result = SimpleNamespace(original="tool output", compressed="<<ccr:abcdef123456>>")
+    with caplog.at_level("DEBUG", logger="headroom.proxy"):
+        assert openai_handler._openai_responses_cached_ccr_markers_live(result) is True
+
+    assert "CCR liveness check for a cached Responses unit failed" in caplog.text
+    assert "PRIVATE_CREDENTIAL_CANARY" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
 class TokenCounter:
     def count_text(self, text: str) -> int:
         return len(text.split())

@@ -737,7 +737,7 @@ def _openai_responses_cached_ccr_markers_live(result: Any) -> bool:
         store = get_compression_store()
         return all(store.exists(hash_key) for hash_key in hashes)
     except Exception:
-        logger.debug("CCR liveness check for a cached Responses unit failed", exc_info=True)
+        logger.debug("CCR liveness check for a cached Responses unit failed")
         return True
 
 
