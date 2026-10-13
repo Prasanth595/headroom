@@ -98,7 +98,9 @@ def _row_token_counts(word_id_rows: list[list[int | None]]) -> list[int]:
 
     Padding and special tokens both map to no word, so a row's trailing run
     of ``None`` is its padding plus the special tokens every row ends with.
-    The longest row has no padding, so its run is the shortest.
+    The longest row has no padding, so its run is the shortest. Read from
+    the word ids rather than ``attention_mask`` so the count does not depend
+    on the tensor type (numpy for ONNX, torch for CUDA and MPS).
     """
     trailing = []
     for row in word_id_rows:
@@ -1879,7 +1881,7 @@ class KompressCompressor(Transform):
             # URLs, code or citation markers tokenizes past that, and a word
             # beyond the cut gets no keep decision at all. Advance by the words
             # the tokenizer kept whole, so the rest start the next chunk and
-            # every word is scored.
+            # every word is scored or kept.
             chunk_start = 0
             while chunk_start < n_words:
                 remaining: float | None = None
@@ -2000,10 +2002,12 @@ class KompressCompressor(Transform):
                             mask_list = keep_mask[0].cpu()
                     inference_ms += (time.perf_counter() - inference_started) * 1000
 
+                # A word past `scored` is a prefix the cut left behind: it is
+                # rescored with the next chunk and must not take a slot here.
                 if target_ratio is not None:
                     word_scores: dict[int, float] = {}
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         s = float(score_list[idx])
                         if wid not in word_scores or s > word_scores[wid]:
@@ -2017,7 +2021,7 @@ class KompressCompressor(Transform):
                             kept_ids.add(wid + chunk_start)
                 else:
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
@@ -2429,10 +2433,11 @@ class KompressCompressor(Transform):
                         range(chunk_start + scored, chunk_start + len(chunk_words))
                     )
 
-                    # Token -> word reduction (max score per word).
+                    # Token -> word reduction (max score per word). Words from
+                    # `scored` on are kept above and must not take a slot here.
                     word_scores: dict[int, float] = {}
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         s = float(score_list[idx])
                         if wid not in word_scores or s > word_scores[wid]:

@@ -16,6 +16,7 @@ from headroom.transforms import kompress_compressor as kc
 from headroom.transforms.kompress_compressor import KompressCompressor, KompressConfig
 
 WINDOW = 7  # stands in for 512 tokens
+CONTENT = " ".join(f"w{i}" for i in range(25))
 
 
 class _Enc(dict):
@@ -72,6 +73,42 @@ class _RejectsLastTokenModel:
         return [[1.0 if k else 0.0 for k in self._keep(mask)] for mask in attention_mask]
 
 
+class _PrefixOutscoresModel:
+    """Scores a row's last token highest, its first word next, the rest low.
+
+    A split word shows up as that last token. Under a forced ratio its prefix
+    score would take the one slot a whole word earned.
+    """
+
+    def get_keep_mask(self, input_ids, attention_mask):
+        return [[s > 0.5 for s in row] for row in self.get_scores(input_ids, attention_mask)]
+
+    def get_scores(self, input_ids, attention_mask):
+        rows = []
+        for mask in attention_mask:
+            n = int(mask.sum())
+            rows.append([1.0 if i == n - 1 else 0.9 if i < 2 else 0.1 for i in range(len(mask))])
+        return rows
+
+
+def _compress(monkeypatch, path, tokenizer, model, **kwargs):
+    """Run CONTENT through one path with the fake model and tokenizer."""
+    monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (model, tokenizer, "onnx"))
+    # The compressor must agree with the fake on where the window ends.
+    monkeypatch.setattr(kc, "_KOMPRESS_MAX_TOKENS", WINDOW)
+    monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
+    monkeypatch.setenv(kc._KOMPRESS_MUST_KEEP_ENV, "0")
+    compressor = KompressCompressor(
+        KompressConfig(enable_ccr=False, min_input_words=10, chunk_words=10)
+    )
+    if path == "compress":
+        monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
+        return compressor.compress(CONTENT, **kwargs)
+    monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
+    [result] = compressor.compress_batch([CONTENT], batch_size=8, **kwargs)
+    return result
+
+
 CASES = {
     "cut between words": (_Tok(lambda w: 1), _KeepAllModel()),
     "cut inside a word": (_Tok(lambda w: 2), _RejectsLastTokenModel()),
@@ -85,23 +122,38 @@ CASES = {
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("path", ["compress", "compress_batch"])
 def test_words_the_model_did_not_see_whole_are_kept(monkeypatch, path, case):
-    tokenizer, model = CASES[case]
-    monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (model, tokenizer, "onnx"))
-    # The compressor must agree with the fake on where the window ends.
-    monkeypatch.setattr(kc, "_KOMPRESS_MAX_TOKENS", WINDOW, raising=False)
-    monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
-    monkeypatch.setenv(kc._KOMPRESS_MUST_KEEP_ENV, "0")
-    compressor = KompressCompressor(
-        KompressConfig(enable_ccr=False, min_input_words=10, chunk_words=10)
-    )
-    content = " ".join(f"w{i}" for i in range(25))
-
-    if path == "compress":
-        monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
-        result = compressor.compress(content)
-    else:
-        monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
-        [result] = compressor.compress_batch([content], batch_size=8)
+    result = _compress(monkeypatch, path, *CASES[case])
 
     # The model keeps every word it sees whole, so nothing may go missing.
-    assert result.compressed.split() == content.split()
+    assert result.compressed.split() == CONTENT.split()
+
+
+# Two tokens per word and a seven-token window, ratio 0.34 keeps one word of
+# each scored group. The single path advances three words at a time and keeps
+# the first of each group; the batch path keeps the first of each ten-word
+# chunk plus the seven it never saw whole.
+RATIO_EXPECTED = {
+    "compress": ["w0", "w3", "w6", "w9", "w12", "w15", "w18", "w21", "w24"],
+    "compress_batch": [
+        *["w0", "w3", "w4", "w5", "w6", "w7", "w8", "w9"],
+        *["w10", "w13", "w14", "w15", "w16", "w17", "w18", "w19"],
+        *["w20", "w23", "w24"],
+    ],
+}
+
+
+@pytest.mark.parametrize("path", ["compress", "compress_batch"])
+def test_a_split_word_takes_no_slot_under_a_forced_ratio(monkeypatch, path):
+    result = _compress(
+        monkeypatch, path, _Tok(lambda w: 2), _PrefixOutscoresModel(), target_ratio=0.34
+    )
+
+    assert result.compressed.split() == RATIO_EXPECTED[path]
+
+
+def test_row_token_counts_tell_padding_from_special_tokens():
+    # [CLS] w0 w0 w1 [SEP] and [CLS] w0 [SEP] [PAD] [PAD]: the longest row has no
+    # padding, so its trailing run of None is the special-token count.
+    rows = [[None, 0, 0, 1, None], [None, 0, None, None, None]]
+
+    assert kc._row_token_counts(rows) == [5, 3]
