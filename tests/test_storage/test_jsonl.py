@@ -73,15 +73,21 @@ def test_jsonl_aware_time_bounds_are_inclusive(method: str, tmp_path: Path) -> N
     with JSONLStorage(str(tmp_path / "metrics.jsonl")) as storage:
         for request_id, delta in [("before", -1), ("boundary", 0), ("after", 1)]:
             storage.save(_metrics(request_id, boundary + timedelta(microseconds=delta)))
-        result = getattr(storage, method)(start_time=local_boundary, end_time=local_boundary)
-        if method == "query":
-            assert _ids(result) == ["boundary"]
-        elif method == "count":
-            assert result == 1
-        else:
-            assert result["total_requests"] == 1
-            assert result["total_tokens_before"] == 1000
-            assert result["total_tokens_after"] == 800
+        scenarios = [
+            ({"start_time": local_boundary}, ["after", "boundary"]),
+            ({"end_time": local_boundary}, ["boundary", "before"]),
+            ({"start_time": local_boundary, "end_time": local_boundary}, ["boundary"]),
+        ]
+        for filters, expected_ids in scenarios:
+            result = getattr(storage, method)(**filters)
+            if method == "query":
+                assert _ids(result) == expected_ids, filters
+            elif method == "count":
+                assert result == len(expected_ids), filters
+            else:
+                assert result["total_requests"] == len(expected_ids), filters
+                assert result["total_tokens_before"] == 1000 * len(expected_ids), filters
+                assert result["total_tokens_after"] == 800 * len(expected_ids), filters
 
 
 def _assert_timestamp_desc(metrics: list[RequestMetrics]) -> None:
