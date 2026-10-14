@@ -69,6 +69,15 @@ dependencies = [
     # cert store), where IT installs corporate TLS-inspection roots (Zscaler,
     # Netskope). Pure Python, no deps; the same library pip uses by default.
     "truststore>=0.10.0",
+    # Not imported directly: huggingface-hub (via litellm -> tokenizers, so in
+    # every install) uses it for Hub downloads. Before 1.6.0 its worker threads
+    # could re-initialize or re-enter Python while the interpreter shut down
+    # after a download, crashing the process at exit (SIGSEGV in
+    # Py_InitializeEx, or a fatal TstateNULL error). Declared here rather than
+    # as a uv constraint so the floor reaches the published wheel's metadata
+    # and pip upgrades an older copy. Same platform marker as huggingface-hub's
+    # own hf-xet requirement, so it never installs where hf-xet would not.
+    "hf-xet>=1.6.0; platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'",
 ]
 
 [project.optional-dependencies]
@@ -405,12 +414,6 @@ constraint-dependencies = [
     "aiohttp>=3.14.3",
     # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
     "cryptography>=50.0.0",
-    # Not a CVE: before 1.6.0, hf-xet's worker threads could re-enter or
-    # re-initialize Python while the interpreter shut down after a Hub
-    # download, aborting the process at exit (SIGSEGV in Py_InitializeEx, or
-    # a fatal TstateNULL error). 1.6.0 dropped pyo3's `auto-initialize`, and
-    # 1.5.1 fixed the progress thread. Transitive via huggingface-hub.
-    "hf-xet>=1.6.0",
 ]
 
 # Pin the project's package index to public PyPI. Without this, `uv lock`

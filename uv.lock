@@ -26,7 +26,6 @@ constraints = [
     { name = "aiohttp", specifier = ">=3.14.3" },
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "gitpython", specifier = ">=3.1.58" },
-    { name = "hf-xet", specifier = ">=1.6.0" },
     { name = "langsmith", specifier = ">=0.9.0" },
     { name = "lxml-html-clean", specifier = ">=0.4.5" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
@@ -1505,6 +1504,7 @@ source = { editable = "." }
 dependencies = [
     { name = "ast-grep-cli" },
     { name = "click" },
+    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
     { name = "litellm" },
     { name = "opentelemetry-api" },
     { name = "pydantic" },
@@ -1777,6 +1777,7 @@ requires-dist = [
     { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "mcp", "spreadsheet"], marker = "extra == 'all'" },
     { name = "headroom-ai", extras = ["proxy", "code", "relevance", "reports", "otel", "html", "mcp", "spreadsheet"], marker = "extra == 'sandbox'" },
     { name = "headroom-ai", extras = ["voice"], marker = "extra == 'voice-train'" },
+    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'", specifier = ">=1.6.0" },
     { name = "hnswlib", marker = "extra == 'dev'", specifier = ">=0.8.0" },
     { name = "hnswlib", marker = "extra == 'vector'", specifier = ">=0.8.0" },
     { name = "httpx", marker = "extra == 'mcp'", specifier = ">=0.24.0" },
