@@ -1655,10 +1655,12 @@ class AnthropicHandlerMixin:
             # parallel sub-calls commonly share model+system+history while
             # carrying different tool sets.  Sharing one tracker across those
             # requests pins cache reads at the early tools segment (#2671).
-            from headroom.cache.prefix_tracker import segment_fingerprint
+            # Deferred tools are not in that key, so a ToolSearch load that
+            # appends one keeps the conversation's lineage.
+            from headroom.cache.prefix_tracker import cache_key_tools, segment_fingerprint
 
-            affinity_tools = self._tools_for_forwarding(
-                body.get("tools"), preserve_order=preserve_tool_order
+            affinity_tools = cache_key_tools(
+                self._tools_for_forwarding(body.get("tools"), preserve_order=preserve_tool_order)
             )
             cache_affinity = segment_fingerprint(
                 {

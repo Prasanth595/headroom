@@ -1,0 +1,223 @@
+"""A tool Claude Code's ToolSearch loads is not a new conversation.
+
+Claude Code appends every tool its ToolSearch loads to ``tools``, still marked
+``defer_loading``, and Anthropic keeps deferred tools out of the prompt it
+caches. The prefix-tracker lineage key hashed the whole ``tools`` array, so
+the turn after a load started a new lineage at frozen=0, the pipeline re-ran
+the whole history, and history it had forwarded verbatim came out compressed:
+different bytes, so the provider re-wrote the message tier.
+
+The upstream below models Anthropic's prompt cache with deferred tools left
+out of the key, so the assertions are on what the provider would do with the
+bytes the handler forwards.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from typing import Any
+
+import pytest
+
+pytest.importorskip("fastapi")
+
+import httpx
+from fastapi.testclient import TestClient
+
+from headroom.cache.prefix_tracker import PrefixCacheTracker, cache_key_tools
+from headroom.proxy.server import ProxyConfig, create_app
+
+MODEL = "claude-sonnet-4-5-20250929"
+SYSTEM = [{"type": "text", "text": "You are a coding agent. " * 40}]
+TOOL = {"name": "Read", "input_schema": {"type": "object"}}
+DEFERRED = {"name": "mcp__docs__search", "input_schema": {"type": "object"}, "defer_loading": True}
+EAGER = {"name": "WebFetch", "input_schema": {"type": "object"}}
+MARKER = {"type": "ephemeral"}
+
+
+def _strip(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _strip(v) for k, v in obj.items() if k != "cache_control"}
+    if isinstance(obj, list):
+        return [_strip(v) for v in obj]
+    return obj
+
+
+def _history(turns: int) -> list[dict[str, Any]]:
+    """A session of file reads. Token mode keeps recent reads verbatim and
+    compresses older ones, so a history re-run at frozen=0 changes bytes the
+    provider already cached."""
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": [{"type": "text", "text": "Audit the repo."}]}
+    ]
+    for i in range(turns):
+        tid = f"toolu_{i:02d}"
+        rows = [{"path": f"src/m{i}/f{j}.py", "size": 1000 + j, "ok": True} for j in range(400)]
+        messages += [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tid,
+                        "name": "Read",
+                        "input": {"file_path": f"/repo/m{i}.json"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tid, "content": json.dumps(rows)}
+                ],
+            },
+        ]
+    messages[-1]["content"][-1]["cache_control"] = dict(MARKER)
+    return messages
+
+
+class _PromptCache:
+    """Anthropic's prompt cache at message granularity, deferred tools unkeyed."""
+
+    def __init__(self) -> None:
+        self._written: set[str] = set()
+
+    def request(self, body: dict[str, Any]) -> tuple[int, int]:
+        messages = body["messages"]
+        tools = [t for t in body.get("tools") or [] if not t.get("defer_loading")]
+        head = json.dumps(_strip([tools, body.get("system")]), sort_keys=True)
+        keys = [
+            head + json.dumps(_strip(messages[: i + 1]), sort_keys=True)
+            for i in range(len(messages))
+        ]
+        last = len(messages) - 1
+        hit = max((i for i in range(last + 1) if keys[i] in self._written), default=-1)
+        self._written.add(keys[last])
+        tokens = PrefixCacheTracker._estimate_message_tokens(messages)
+        return sum(tokens[: hit + 1]), sum(tokens[hit + 1 :])
+
+
+def _drive(requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]) -> list[dict]:
+    """Send (tools, messages) through the real handler; record each request's
+    resolved tracker, its frozen count, what was forwarded and the provider's
+    cache read and write."""
+    app = create_app(
+        ProxyConfig(
+            optimize=True,
+            mode="token",
+            disable_kompress=True,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    cache = _PromptCache()
+    seen: list[dict] = []
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        store = proxy.session_tracker_store
+        resolve = store.resolve_tracker
+
+        def _resolve(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            tracker = resolve(*args, **kwargs)
+            seen.append({"tracker": tracker, "frozen": tracker.get_frozen_message_count()})
+            return tracker
+
+        store.resolve_tracker = _resolve
+
+        async def _upstream(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN003
+            read, write = cache.request(body)
+            seen[-1]["forwarded"] = copy.deepcopy(body["messages"])
+            seen[-1]["read"] = read
+            seen[-1]["write"] = write
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_x",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": MODEL,
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "cache_read_input_tokens": read,
+                        "cache_creation_input_tokens": write,
+                    },
+                },
+            )
+
+        proxy._retry_request = _upstream
+        for tools, messages in requests:
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": MODEL,
+                    "max_tokens": 64,
+                    "system": SYSTEM,
+                    "tools": tools,
+                    "messages": messages,
+                },
+            )
+            assert response.status_code == 200, response.text[:300]
+    assert len(seen) == len(requests)
+    return seen
+
+
+def _session(added: dict[str, Any]) -> tuple[dict, dict]:
+    turns = [([TOOL], _history(n)) for n in range(1, 10)]
+    turns.append(([TOOL, added], _history(10)))
+    seen = _drive(turns)
+    return seen[-2], seen[-1]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(monkeypatch, tmp_path):  # noqa: ANN001, ANN202
+    from headroom.cache.compression_store import reset_compression_store
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    # Each proxied request appends to the savings ledger, by default the
+    # developer's real ~/.headroom/savings_events.jsonl.
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(tmp_path / "savings_events.jsonl"))
+    reset_compression_store()
+
+
+def test_deferred_tool_load_keeps_the_lineage_and_its_cached_prefix() -> None:
+    before, after = _session(DEFERRED)
+
+    assert after["tracker"] is before["tracker"]
+    assert after["frozen"] == len(before["forwarded"])
+    assert _strip(after["forwarded"][: len(before["forwarded"])]) == _strip(before["forwarded"])
+    assert after["read"] == before["read"] + before["write"]
+
+
+def test_kill_switch_keys_deferred_tools_again(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setenv("HEADROOM_DEFERRED_TOOL_AFFINITY", "0")
+    before, after = _session(DEFERRED)
+
+    assert after["tracker"] is not before["tracker"]
+    assert after["frozen"] == 0
+    # The cost the fix removes: the re-run compressed reads that were
+    # forwarded verbatim, so the provider read none of the history back.
+    assert after["read"] == 0
+
+
+def test_eager_tool_still_starts_a_new_lineage() -> None:
+    before, after = _session(EAGER)
+
+    assert after["tracker"] is not before["tracker"]
+    assert after["frozen"] == 0
+
+
+def test_cache_key_tools_drops_only_deferred_tools(monkeypatch) -> None:  # noqa: ANN001
+    undeferred = {**DEFERRED, "defer_loading": False}
+    tools = [TOOL, DEFERRED, undeferred]
+
+    assert cache_key_tools(tools) == [TOOL, undeferred]
+    assert tools == [TOOL, DEFERRED, undeferred]
+    assert cache_key_tools(None) is None
+    monkeypatch.setenv("HEADROOM_DEFERRED_TOOL_AFFINITY", "off")
+    assert cache_key_tools(tools) is tools
