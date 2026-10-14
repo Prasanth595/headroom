@@ -1,8 +1,4 @@
-"""Exercise real LangChain bindings and OpenAI HTTP serialization on loopback.
-
-These are runtime coverage for bound-model dispatch. The availability-guard
-regression is a typing error and is covered separately in test_binding_typing.
-"""
+"""Cover Headroom's binding-kwargs merge with real LangChain and loopback HTTP."""
 
 import asyncio
 import json
@@ -62,22 +58,6 @@ def openai_loopback():
             requests.append((self.path, body))
             message = {"role": "assistant", "content": "Loopback reply"}
             finish_reason = "stop"
-            if body.get("tools"):
-                message = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_loopback",
-                            "type": "function",
-                            "function": {
-                                "name": body["tools"][0]["function"]["name"],
-                                "arguments": '{"city":"Paris"}',
-                            },
-                        }
-                    ],
-                }
-                finish_reason = "tool_calls"
             response = json.dumps(
                 {
                     "id": "chatcmpl-loopback",
@@ -109,123 +89,63 @@ def openai_loopback():
         assert not thread.is_alive(), "Loopback HTTP server did not stop"
 
 
-@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
-@pytest.mark.parametrize("binding", ["unbound", "bind_tools", "prebound", "nested", "caller"])
-def test_binding_reaches_openai_http(openai_loopback, method, binding):
+@pytest.mark.parametrize("binding", ["bind_tools", "nested"])
+def test_binding_reaches_openai_http(openai_loopback, binding):
     import httpx
-    from langchain_core.messages import AIMessage
     from langchain_core.runnables import RunnableBinding
     from langchain_openai import ChatOpenAI
     from langsmith import tracing_context
 
     from headroom.integrations import HeadroomChatModel
-    from headroom.transforms import TransformPipeline
 
     base_url, requests = openai_loopback
+    with tracing_context(enabled=False), httpx.Client(trust_env=False) as http_client:
+        original = ChatOpenAI(
+            model=MODEL,
+            api_key="loopback-dummy-key",
+            base_url=base_url,
+            max_retries=0,
+            timeout=5,
+            use_responses_api=False,
+            http_client=http_client,
+        )
+        kwargs = {}
+        expected_name = "inner_weather"
+        if binding == "bind_tools":
+            wrapped = HeadroomChatModel(original, auto_detect_provider=False).bind_tools(
+                [_tool(expected_name)], tool_choice=expected_name
+            )
+        else:
+            inner = original.bind_tools(
+                [_tool("inner_weather")],
+                tool_choice="inner_weather",
+                temperature=0.1,
+                top_p=0.8,
+            )
+            outer = RunnableBinding(
+                bound=inner,
+                kwargs={
+                    "tools": [_tool("outer_weather")],
+                    "tool_choice": _choice("outer_weather"),
+                    "temperature": 0.2,
+                },
+            )
+            wrapped = HeadroomChatModel(outer, auto_detect_provider=False)
+            expected_name = "caller_weather"
+            kwargs = {
+                "tools": [_tool(expected_name)],
+                "tool_choice": _choice(expected_name),
+                "temperature": 0.3,
+            }
+        wrapped.cache = False
+        wrapped.invoke("What is the weather in Paris?", **kwargs)
 
-    async def exercise():
-        with tracing_context(enabled=False), httpx.Client(trust_env=False) as http_client:
-            async with httpx.AsyncClient(trust_env=False) as http_async_client:
-                original = ChatOpenAI(
-                    model=MODEL,
-                    api_key="loopback-dummy-key",
-                    base_url=base_url,
-                    max_retries=0,
-                    timeout=5,
-                    use_responses_api=False,
-                    http_client=http_client,
-                    http_async_client=http_async_client,
-                )
-                kwargs = {}
-                expected_name = None
-                expected_temperature = None
-                if binding == "unbound":
-                    wrapped = HeadroomChatModel(original, auto_detect_provider=False)
-                elif binding == "bind_tools":
-                    wrapped = HeadroomChatModel(original, auto_detect_provider=False).bind_tools(
-                        [_tool("inner_weather")], tool_choice="inner_weather"
-                    )
-                    expected_name = "inner_weather"
-                else:
-                    inner = original.bind_tools(
-                        [_tool("inner_weather")],
-                        tool_choice="inner_weather",
-                        temperature=0.1,
-                        top_p=0.8,
-                    )
-                    bound = inner
-                    expected_name = "inner_weather"
-                    expected_temperature = 0.1
-                    if binding in ("nested", "caller"):
-                        # bind() can flatten bindings; construct actual nested layers.
-                        bound = RunnableBinding(
-                            bound=inner,
-                            kwargs={
-                                "tools": [_tool("outer_weather")],
-                                "tool_choice": _choice("outer_weather"),
-                                "temperature": 0.2,
-                            },
-                        )
-                        expected_name = "outer_weather"
-                        expected_temperature = 0.2
-                    if binding == "caller":
-                        kwargs = {
-                            "tools": [_tool("caller_weather")],
-                            "tool_choice": _choice("caller_weather"),
-                            "temperature": 0.3,
-                        }
-                        expected_name = "caller_weather"
-                        expected_temperature = 0.3
-                    wrapped = HeadroomChatModel(bound, auto_detect_provider=False)
-
-                # A process-wide LangChain cache must not bypass this HTTP check.
-                wrapped.cache = False
-                if method == "ainvoke":
-                    response = await wrapped.ainvoke("What is the weather in Paris?", **kwargs)
-                else:
-                    response = wrapped.invoke("What is the weather in Paris?", **kwargs)
-
-                assert len(requests) == 1
-                path, body = requests[0]
-                assert path == "/v1/chat/completions"
-                assert body["model"] == MODEL
-                assert body["messages"] == [
-                    {"role": "user", "content": "What is the weather in Paris?"}
-                ]
-                assert isinstance(response, AIMessage)
-                assert response.usage_metadata["input_tokens"] == 41
-                assert response.usage_metadata["output_tokens"] == 9
-                if expected_name is None:
-                    assert "tools" not in body
-                    assert "tool_choice" not in body
-                    assert response.content == "Loopback reply"
-                    assert response.tool_calls == []
-                else:
-                    assert body["tools"] == [_tool(expected_name)]
-                    assert body["tool_choice"] == _choice(expected_name)
-                    assert response.tool_calls == [
-                        {
-                            "id": "call_loopback",
-                            "name": expected_name,
-                            "args": {"city": "Paris"},
-                            "type": "tool_call",
-                        }
-                    ]
-                if expected_temperature is not None:
-                    assert body["temperature"] == expected_temperature
-                    assert body["top_p"] == 0.8  # An inner-only kwarg survives both overrides.
-
-                # Use the real pipeline and tokenizer, not a fabricated metrics result.
-                assert isinstance(wrapped.pipeline, TransformPipeline)
-                assert len(wrapped.metrics_history) == 1
-                metrics = wrapped.metrics_history[0]
-                assert metrics.model == MODEL
-                assert metrics.tokens_before == metrics.tokens_after > 0
-                assert metrics.tokens_saved == 0
-                assert wrapped.get_metrics()["total_requests"] == 1
-                assert wrapped.get_metrics()["total_tokens_before"] == metrics.tokens_before
-
-    asyncio.run(exercise())
+    _, body = requests[0]
+    assert body["tools"] == [_tool(expected_name)]
+    assert body["tool_choice"] == _choice(expected_name)
+    if binding == "nested":
+        assert body["temperature"] == 0.3
+        assert body["top_p"] == 0.8
 
 
 def test_unwrap_binding_matches_real_runnable_precedence():

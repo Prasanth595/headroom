@@ -126,6 +126,8 @@ Enable or disable automatic Copilot review in **Settings → Rules → Rulesets 
 - For an optional-integration change, run its owner tests and `mypy headroom`
   with the relevant extra installed. A hook environment without that dependency
   does not check the imported library's types.
+  CI lint installs `langchain-core` for its normal mypy run; keep typechecking
+  there rather than launching a second mypy subprocess from pytest.
 - **Headroom writes LF and normalizes on read, on every platform.** Pass
   `newline="\n"` to every `write_text`/`open` that writes a context, memory,
   or state file, and normalize `\r\n`/`\r` when you read one back. Without

@@ -3,12 +3,12 @@
 Each test here corresponds to a defect that shipped in 0.37.0 and was found by
 running the documented examples against langchain-core 1.6:
 
-2. ``wrap_tools_with_headroom`` produced tools that raised ``TypeError`` on
+1. ``wrap_tools_with_headroom`` produced tools that raised ``TypeError`` on
    invoke, because ``StructuredTool`` calls its ``func`` with unpacked kwargs
    while ``BaseTool.invoke`` takes a single input.
-3. The wrapped tool lost the original ``args_schema``, so a model saw a tool
+2. The wrapped tool lost the original ``args_schema``, so a model saw a tool
    with no parameters.
-4. ``HeadroomDocumentCompressor`` silently subclassed a local stub rather than
+3. ``HeadroomDocumentCompressor`` silently subclassed a local stub rather than
    LangChain's ``BaseDocumentCompressor``, so retrievers rejected it.
 """
 
@@ -44,7 +44,7 @@ def query_database(query: str) -> str:
 
 
 class TestWrappedToolIsUsable:
-    """Defects 2 and 3: the wrapped tool must invoke, and keep its schema."""
+    """Defects 1 and 2: the wrapped tool must invoke, and keep its schema."""
 
     def test_invoke_with_keyword_arguments(self):
         from headroom.integrations import wrap_tools_with_headroom
