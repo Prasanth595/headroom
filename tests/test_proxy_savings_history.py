@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import math
 import os
 import stat
 import tempfile
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from types import SimpleNamespace
 
 import pytest
@@ -1500,6 +1502,54 @@ def test_savings_tracker_loads_non_finite_persisted_state_without_crashing(tmp_p
         assert math.isfinite(value), f"{key} is non-finite: {value}"
     assert lifetime["tokens_saved"] == 0
     assert lifetime["total_input_tokens"] == 0
+
+
+def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "proxy_savings.json"))
+    app = create_app(
+        ProxyConfig(
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            disable_kompress=True,
+        )
+    )
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
+        _record_request(client, model="gpt-4o", tokens_saved=40)
+        response = client.get("/stats-history?format=csv&series=daily")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].split(";", 1)[0] == "text/csv"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="headroom-stats-history-daily.csv"'
+    )
+    rows = csv.reader(StringIO(response.text))
+    assert next(rows) == [
+        "timestamp",
+        "tokens_saved",
+        "compression_savings_usd_delta",
+        "total_tokens_saved",
+        "compression_savings_usd",
+        "total_input_tokens_delta",
+        "total_input_tokens",
+        "total_input_cost_usd_delta",
+        "total_input_cost_usd",
+        "output_tokens_saved_delta",
+        "output_savings_usd_delta",
+        "tool_tokens_saved_delta",
+        "tool_schema_savings_usd_delta",
+        "total_output_cost_usd_delta",
+        "pricing_basis",
+        "legacy_compression_savings_usd",
+        "legacy_tool_schema_savings_usd",
+    ]
+    row = next(rows)
+    assert int(row[1]) == 40
+    assert int(row[3]) == 40
+    assert int(row[5]) == 120
+    assert int(row[6]) == 120
+    assert row[14] == "cache-region-v1"
 
 
 def test_cache_read_savings_accumulate_and_survive_restart(tmp_path, monkeypatch):

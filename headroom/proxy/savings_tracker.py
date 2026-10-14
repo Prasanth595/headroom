@@ -29,6 +29,7 @@ from headroom.proxy import project_name_policy
 from headroom.proxy.persistent_metrics import (
     PRICING_BASIS,
     PersistentMetricsState,
+    _coerce_signed_float,
     normalize_compression_prices,
 )
 
@@ -218,26 +219,20 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
     return max(coerced, 0.0)
 
 
-def _coerce_signed_float(value: Any, default: float = 0.0) -> float:
-    """``_coerce_float`` without the zero floor, for quantities that can lose.
-
-    The floor in ``_coerce_float`` is right for the things it mostly guards --
-    token counts, input costs, cumulative totals -- none of which have a
-    meaningful negative value. It is wrong for per-request compression savings,
-    which genuinely go negative when a rewrite displaces tokens out of the
-    cached prefix and they come back billed at the fresh-input rate. Flooring
-    those reported a gain on a turn that lost money. Kept as a separate helper
-    rather than a flag on ``_coerce_float`` so the callers that want a floor
-    keep getting one by default.
-    """
-
-    try:
-        coerced = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-    if not math.isfinite(coerced):
-        return default
-    return coerced
+def _recover_component(lifetime_raw: Any, last: dict[str, Any], key: str) -> float:
+    """Prefer authoritative lifetime prices; otherwise recover the checkpoint."""
+    raw = lifetime_raw if isinstance(lifetime_raw, dict) else {}
+    current = raw.get("pricing_basis") == PRICING_BASIS
+    if key.startswith("legacy_"):
+        base_key = key.removeprefix("legacy_")
+        if key in raw or (not current and base_key in raw):
+            value = _coerce_signed_float(raw.get(key))
+            if not current:
+                value += _coerce_signed_float(raw.get(base_key))
+            return round(value, 6)
+    elif current and key in raw:
+        return round(_coerce_signed_float(raw.get(key)), 6)
+    return _coerce_signed_float(last.get(key))
 
 
 PROVIDER_UNKNOWN = "unknown"
@@ -1734,11 +1729,11 @@ class SavingsTracker:
                 "timestamp",
                 "total_tokens_saved",
                 "compression_savings_usd",
+                "total_input_tokens",
+                "total_input_cost_usd",
                 "pricing_basis",
                 "legacy_compression_savings_usd",
                 "legacy_tool_schema_savings_usd",
-                "total_input_tokens",
-                "total_input_cost_usd",
             ]
         else:
             fieldnames = [
@@ -1747,9 +1742,6 @@ class SavingsTracker:
                 "compression_savings_usd_delta",
                 "total_tokens_saved",
                 "compression_savings_usd",
-                "pricing_basis",
-                "legacy_compression_savings_usd",
-                "legacy_tool_schema_savings_usd",
                 "total_input_tokens_delta",
                 "total_input_tokens",
                 "total_input_cost_usd_delta",
@@ -1759,6 +1751,9 @@ class SavingsTracker:
                 "tool_tokens_saved_delta",
                 "tool_schema_savings_usd_delta",
                 "total_output_cost_usd_delta",
+                "pricing_basis",
+                "legacy_compression_savings_usd",
+                "legacy_tool_schema_savings_usd",
             ]
 
         buffer = StringIO()
@@ -1914,44 +1909,20 @@ class SavingsTracker:
                 lifetime_tokens_saved,
                 last["total_tokens_saved"],
             )
-            if (
-                not isinstance(lifetime_raw, dict)
-                or lifetime_raw.get("pricing_basis") != PRICING_BASIS
-                or "compression_savings_usd" not in lifetime_raw
-            ):
-                lifetime_savings_usd = _coerce_signed_float(last["compression_savings_usd"])
-            if not isinstance(lifetime_raw, dict) or (
-                "legacy_compression_savings_usd" not in lifetime_raw
-                and (
-                    lifetime_raw.get("pricing_basis") == PRICING_BASIS
-                    or "compression_savings_usd" not in lifetime_raw
-                )
-            ):
-                legacy_savings_usd = _coerce_signed_float(
-                    last.get("legacy_compression_savings_usd")
-                )
+            lifetime_savings_usd = _recover_component(lifetime_raw, last, "compression_savings_usd")
+            legacy_savings_usd = _recover_component(
+                lifetime_raw, last, "legacy_compression_savings_usd"
+            )
             lifetime_tool_tokens_saved = max(
                 lifetime_tool_tokens_saved,
                 _coerce_int(last.get("tool_tokens_saved")),
             )
-            if (
-                not isinstance(lifetime_raw, dict)
-                or lifetime_raw.get("pricing_basis") != PRICING_BASIS
-                or "tool_schema_savings_usd" not in lifetime_raw
-            ):
-                lifetime_tool_savings_usd = _coerce_signed_float(
-                    last.get("tool_schema_savings_usd")
-                )
-            if not isinstance(lifetime_raw, dict) or (
-                "legacy_tool_schema_savings_usd" not in lifetime_raw
-                and (
-                    lifetime_raw.get("pricing_basis") == PRICING_BASIS
-                    or "tool_schema_savings_usd" not in lifetime_raw
-                )
-            ):
-                legacy_tool_savings_usd = _coerce_signed_float(
-                    last.get("legacy_tool_schema_savings_usd")
-                )
+            lifetime_tool_savings_usd = _recover_component(
+                lifetime_raw, last, "tool_schema_savings_usd"
+            )
+            legacy_tool_savings_usd = _recover_component(
+                lifetime_raw, last, "legacy_tool_schema_savings_usd"
+            )
             lifetime_input_tokens = max(
                 lifetime_input_tokens,
                 _coerce_int(last.get("total_input_tokens")),

@@ -346,6 +346,28 @@ def is_copilot_completions_host(url: str | None) -> bool:
     return host.startswith("proxy.") and host.endswith(".githubcopilot.com")
 
 
+def copilot_nes_base_url(model: Any, upstream_base_url: str) -> str | None:
+    """Return the completions host for a next-edit request aimed at public CAPI.
+
+    Copilot Chat serves ghost text and next edits by posting ``copilot-nes-*``
+    models to ``{overrideProxyUrl}/chat/completions``. ``headroom wrap vscode``
+    points that override at the same proxy as CAPI, but only the completions
+    host serves these models; CAPI answers ``400 model_not_supported``.
+
+    Returns ``None`` (keep the upstream) for any other model, for an upstream
+    that already is a completions host, and for a GHE or custom deployment,
+    whose traffic must not leave it (see :func:`copilot_completions_base_url`).
+    """
+
+    if not (isinstance(model, str) and model.startswith("copilot-nes-")):
+        return None
+    if not _is_public_copilot_api_host(_url_host(upstream_base_url)):
+        return None
+    if is_copilot_completions_host(upstream_base_url):
+        return None
+    return copilot_completions_base_url()
+
+
 def copilot_completions_base_url() -> str:
     """Return the base URL serving Copilot's inline-completions endpoint.
 
