@@ -3263,18 +3263,14 @@ class ContentRouter(Transform):
         compressed = "\n\n".join(compressed_sections)
         if protected:
             compressed = restore_tags(compressed, protected)
-        applied_strategies = {
-            decision.strategy
-            for decision in routing_log
-            if decision.compressed_tokens < decision.original_tokens
-        }
+        routed_strategies = {decision.strategy for decision in routing_log}
 
         return RouterCompressionResult(
             compressed=compressed,
             original=content,
             strategy_used=(
-                next(iter(applied_strategies))
-                if len(applied_strategies) == 1
+                next(iter(routed_strategies))
+                if len(routed_strategies) == 1
                 else CompressionStrategy.MIXED
             ),
             routing_log=routing_log,

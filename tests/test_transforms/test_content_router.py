@@ -1865,3 +1865,23 @@ class TestMixedContentTagProtection:
 
         assert "MANGLED" in result.compressed
         assert result.strategy_used == CompressionStrategy.MIXED
+
+
+class TestMixedContentAttribution:
+    def test_minified_json_with_unchanged_code_remains_mixed(self):
+        value = {f"field_{i}": i for i in range(500)}
+        code = "print('preserve this unchanged')"
+        content = f"```python\n{code}\n```\n\n{json.dumps(value, indent=2)}"
+        router = ContentRouter(ContentRouterConfig(min_section_tokens=10, enable_kompress=False))
+
+        result = router._compress_mixed(content, context="")
+
+        assert result.strategy_used == CompressionStrategy.MIXED
+        assert code in result.compressed
+        json_block = result.compressed.split("```", 2)[2].strip()
+        assert json.loads(json_block) == value
+        assert {decision.strategy for decision in result.routing_log} == {
+            CompressionStrategy.CODE_AWARE,
+            CompressionStrategy.JSON_MINIFIER,
+        }
+        assert result.total_compressed_tokens < result.total_original_tokens
