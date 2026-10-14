@@ -169,3 +169,19 @@ describe("detectFormat: Vercel media parts", () => {
     ).toBe("anthropic");
   });
 });
+
+describe("detectFormat: Anthropic document blocks", () => {
+  it("detects a turn whose only Anthropic marker is a document block", () => {
+    expect(
+      detectFormat([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Report" },
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } },
+          ],
+        },
+      ]),
+    ).toBe("anthropic");
+  });
+});

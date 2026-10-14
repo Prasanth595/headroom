@@ -1211,3 +1211,104 @@ describe("assistant media across formats", () => {
     ]);
   });
 });
+
+describe("Vercel V4 tagged file data", () => {
+  it("carries a data-tagged file part and restores the tagged shape", () => {
+    const original = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "file", mediaType: "image/png", data: { type: "data", data: new Uint8Array([137, 80, 78, 71]) } },
+        ],
+      },
+    ];
+    const openai = vercelToOpenAI(original);
+    expect(openai[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,iVBORw==", part: "file", data_tag: "data" },
+    });
+    expect(openAIToVercel(openai)).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "file", mediaType: "image/png", data: { type: "data", data: "iVBORw==" } },
+        ],
+      },
+    ]);
+  });
+
+  it("carries a url-tagged file part and restores a URL object inside the tag", () => {
+    const original = [
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: { type: "url", url: new URL("https://example.com/a.pdf") } }] },
+    ];
+    const openai = vercelToOpenAI(original);
+    expect(openai[0].content[0]).toEqual({
+      type: "image_url",
+      image_url: { url: "https://example.com/a.pdf", part: "file", mime_type: "application/pdf", data_tag: "url" },
+    });
+    const part = openAIToVercel(openai)[0].content[0];
+    expect(part.type).toBe("file");
+    expect(part.mediaType).toBe("application/pdf");
+    expect(part.data.type).toBe("url");
+    expect(part.data.url).toBeInstanceOf(URL);
+    expect(part.data.url.toString()).toBe("https://example.com/a.pdf");
+  });
+
+  it("round-trips a text-tagged file part", () => {
+    const original = [
+      { role: "user", content: [{ type: "file", mediaType: "text/plain", data: { type: "text", text: "hello, file" }, filename: "a.txt" }] },
+    ];
+    expect(openAIToVercel(vercelToOpenAI(original))).toEqual(original);
+  });
+
+  it("preserves a provider reference (tagged and bare) instead of dropping it", () => {
+    const tagged = [
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: { type: "reference", reference: { openai: "file-abc" } } }] },
+    ];
+    expect(openAIToVercel(vercelToOpenAI(tagged))).toEqual(tagged);
+    const bare = [{ role: "user", content: [{ type: "file", mediaType: "application/pdf", data: { openai: "file-abc" } }] }];
+    expect(openAIToVercel(vercelToOpenAI(bare))).toEqual(bare);
+  });
+});
+
+describe("assistant text separators across formats", () => {
+  it("openAIToAnthropic joins adjacent assistant text parts with a newline into one block", () => {
+    const msgs = [
+      { role: "assistant", content: [{ type: "text", text: "first" }, { type: "text", text: "second" }] },
+    ] as OpenAIMessage[];
+    expect(openAIToAnthropic(msgs)).toEqual([{ role: "assistant", content: "first\nsecond" }]);
+  });
+
+  it("openAIToAnthropic keeps text runs around media as single blocks in order", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "a" },
+          { type: "text", text: "b" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } },
+          { type: "text", text: "c" },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToAnthropic(msgs)).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "a\nb" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw==" } },
+          { type: "text", text: "c" },
+        ],
+      },
+    ]);
+  });
+
+  it("openAIToGemini joins adjacent assistant text parts with a newline into one part", () => {
+    const msgs = [
+      { role: "assistant", content: [{ type: "text", text: "first" }, { type: "text", text: "second" }] },
+    ] as OpenAIMessage[];
+    expect(openAIToGemini(msgs)).toEqual([{ role: "model", parts: [{ text: "first\nsecond" }] }]);
+  });
+});

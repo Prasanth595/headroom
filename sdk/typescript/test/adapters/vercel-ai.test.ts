@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { LanguageModelV3 } from "@ai-sdk/provider";
+import type { LanguageModelV3, LanguageModelV4FilePart, LanguageModelV4Prompt } from "@ai-sdk/provider";
 import {
   headroomMiddleware,
   compressVercelMessages,
@@ -219,6 +219,63 @@ describe("headroomMiddleware", () => {
         { type: "file", mediaType: "image/png", data: "iVBORw==" },
       ],
     });
+  });
+
+  it("round-trips a LanguageModelV4 file part (tagged data) through transformParams", async () => {
+    const filePart: LanguageModelV4FilePart = {
+      type: "file",
+      mediaType: "image/png",
+      data: { type: "data", data: new Uint8Array([137, 80, 78, 71]) },
+    };
+    const prompt: LanguageModelV4Prompt = [{ role: "user", content: [{ type: "text", text: "what is this?" }, filePart] }];
+    // The proxy keeps the media part and compresses only the text.
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "compressed" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file", data_tag: "data" } },
+          ],
+        },
+      ]),
+    );
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({ params: { prompt }, model: { specificationVersion: "v4" }, type: "generate" });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,iVBORw==", part: "file", data_tag: "data" },
+    });
+    const restored: LanguageModelV4FilePart = out.prompt[0].content[1];
+    expect(restored).toEqual({ type: "file", mediaType: "image/png", data: { type: "data", data: "iVBORw==" } });
+  });
+
+  it("passes a provider file reference through transformParams untouched", async () => {
+    const filePart: LanguageModelV4FilePart = {
+      type: "file",
+      mediaType: "application/pdf",
+      data: { type: "reference", reference: { openai: "file-abc" } },
+    };
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "compressed" },
+            { type: "image_url", image_url: { url: "data:application/pdf;base64,", part: "file", data_tag: "reference", reference: { openai: "file-abc" } } },
+          ],
+        },
+      ]),
+    );
+    const middleware = headroomMiddleware({ baseUrl: "http://localhost:8787" });
+    const out = await middleware.transformParams({
+      params: { prompt: [{ role: "user", content: [{ type: "text", text: "summarise" }, filePart] }] },
+      model: { specificationVersion: "v4" },
+      type: "generate",
+    });
+    expect(out.prompt[0].content[1]).toEqual(filePart);
   });
 });
 

@@ -14,6 +14,7 @@
 import type {
   OpenAIMessage,
   AssistantMessage,
+  ContentPart,
   ToolCall,
 } from "../types.js";
 
@@ -51,8 +52,8 @@ export function detectFormat(messages: any[]): MessageFormat {
         if (part.type === "tool-call" || part.type === "tool-result") return "vercel";
         // Anthropic: underscored types
         if (part.type === "tool_use" || part.type === "tool_result") return "anthropic";
-        // Anthropic: image with source.type
-        if (part.type === "image" && part.source?.type) return "anthropic";
+        // Anthropic: image / document with source.type
+        if ((part.type === "image" || part.type === "document") && part.source?.type) return "anthropic";
         // Vercel: `file` parts carry data/mediaType (OpenAI's `file` part carries a `file` object);
         // `image` parts carry `image` (Anthropic's carry `source`)
         if (part && typeof part === "object") {
@@ -255,10 +256,10 @@ export function openAIToAnthropic(messages: OpenAIMessage[]): any[] {
       if (typeof msg.content === "string") {
         if (msg.content) blocks.push({ type: "text", text: msg.content });
       } else if (Array.isArray(msg.content)) {
-        for (const p of msg.content) {
-          if (p.type === "text") blocks.push({ type: "text", text: p.text });
-          else if (p.type === "image_url") {
-            const block = anthropicMediaBlock(p.image_url);
+        for (const g of groupAssistantParts(msg.content)) {
+          if ("text" in g) blocks.push({ type: "text", text: g.text });
+          else {
+            const block = anthropicMediaBlock(g.image_url);
             if (block) blocks.push(block);
           }
         }
@@ -315,51 +316,120 @@ function parseUrl(value: string): URL | null {
   }
 }
 
-type VercelMediaImageUrl = { url: string; mime_type?: string; part?: "file"; filename?: string };
+type VercelMediaImageUrl = {
+  url: string;
+  mime_type?: string;
+  part?: "file";
+  filename?: string;
+  // AI SDK 7 / LanguageModelV4 tagged file data: the tag the input used, so the reverse
+  // conversion restores the same shape; absent for the bare AI SDK 6 forms.
+  data_tag?: "data" | "url" | "text" | "reference";
+  // A provider-managed file reference, carried verbatim (it has no bytes or url to convert).
+  reference?: Record<string, string>;
+};
 
-// Vercel `image` / `file` part -> OpenAI image_url object, or null if the data is unconvertible
-// (e.g. a provider file reference). Bytes and base64 travel as a data: URI, which carries the
-// media type; URLs stay URLs with the media type on a private `mime_type` key. `part: "file"`
-// and `filename` are carried so the reverse conversion rebuilds the right part. The proxy
-// passes non-text parts through unchanged, so the private keys survive /v1/compress.
+function base64ToText(b64: string): string {
+  if (typeof Buffer !== "undefined") return Buffer.from(b64, "base64").toString("utf8");
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+// A bare AI SDK 6 provider reference: a plain string-valued record with no `type`.
+function isProviderReference(v: any): boolean {
+  return (
+    !!v &&
+    typeof v === "object" &&
+    !Array.isArray(v) &&
+    !(v instanceof Uint8Array) &&
+    !(v instanceof ArrayBuffer) &&
+    !(v instanceof URL) &&
+    v.type === undefined &&
+    Object.values(v).every((x) => typeof x === "string")
+  );
+}
+
+// Vercel `image` / `file` part -> OpenAI image_url object, or null if the data is unconvertible.
+// Accepts the bare AI SDK 6 forms (bytes, base64, data URL, URL, provider reference) and the
+// AI SDK 7 / LanguageModelV4 tagged forms ({ type: "data" | "url" | "text" | "reference" }).
+// Bytes, base64 and text travel as a data: URI, which carries the media type; URLs stay URLs
+// with the media type on a private `mime_type` key; references are carried verbatim on
+// `reference`. `part: "file"`, `filename` and `data_tag` are carried so the reverse conversion
+// rebuilds the right part in the same shape. The proxy passes non-text parts through unchanged.
 function vercelMediaImageUrl(p: any): VercelMediaImageUrl | null {
-  const data = p.type === "file" ? p.data : p.image;
+  let data = p.type === "file" ? p.data : p.image;
   const mediaType: string | undefined = typeof p.mediaType === "string" ? p.mediaType : p.mimeType;
-  let url: string | null = null;
+  const out: VercelMediaImageUrl = { url: "" };
+  if (p.type === "file") out.part = "file";
+  if (typeof p.filename === "string") out.filename = p.filename;
+
+  if (data && typeof data === "object" && typeof data.type === "string") {
+    if (data.type === "data") {
+      out.data_tag = "data";
+      data = data.data;
+    } else if (data.type === "url") {
+      out.data_tag = "url";
+      data = data.url;
+    } else if (data.type === "text" && typeof data.text === "string") {
+      out.data_tag = "text";
+      out.url = `data:${mediaType ?? "text/plain"};base64,${bytesToBase64(new TextEncoder().encode(data.text))}`;
+      return out;
+    } else if (data.type === "reference" && data.reference && typeof data.reference === "object") {
+      out.data_tag = "reference";
+      out.reference = data.reference;
+      out.url = `data:${mediaType ?? ""};base64,`;
+      return out;
+    } else {
+      return null;
+    }
+  } else if (isProviderReference(data)) {
+    out.reference = data;
+    out.url = `data:${mediaType ?? ""};base64,`;
+    return out;
+  }
+
   let carryType = false;
   if (data instanceof Uint8Array || data instanceof ArrayBuffer) {
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    url = `data:${mediaType ?? ""};base64,${bytesToBase64(bytes)}`;
+    out.url = `data:${mediaType ?? ""};base64,${bytesToBase64(bytes)}`;
   } else if (data instanceof URL) {
-    url = data.toString();
+    out.url = data.toString();
     carryType = true;
   } else if (typeof data === "string") {
-    if (data.startsWith("data:")) url = data;
+    if (data.startsWith("data:")) out.url = data;
     else if (parseUrl(data)) {
-      url = data;
+      out.url = data;
       carryType = true;
-    } else url = `data:${mediaType ?? ""};base64,${data}`;
+    } else out.url = `data:${mediaType ?? ""};base64,${data}`;
+  } else {
+    return null;
   }
-  if (url === null) return null;
-  const out: VercelMediaImageUrl = { url };
   if (carryType && mediaType) out.mime_type = mediaType;
-  if (p.type === "file") out.part = "file";
-  if (typeof p.filename === "string") out.filename = p.filename;
   return out;
 }
 
-// OpenAI image_url -> Vercel `image` or `file` part. A data: URI yields base64 data plus its
-// media type; an http(s) url yields a URL object; anything else stays a string. Never throws.
+// OpenAI image_url -> Vercel `image` or `file` part, in the shape the forward conversion saw
+// (bare, or LanguageModelV4-tagged when `data_tag` is carried). A data: URI yields base64 data
+// plus its media type; an http(s) url yields a URL object; anything else stays a string; a
+// carried provider reference comes back verbatim. Never throws.
 function vercelMediaPart(imageUrl: any): any {
   const url: string = imageUrl.url;
+  const tag: string | undefined = typeof imageUrl.data_tag === "string" ? imageUrl.data_tag : undefined;
   const m = /^data:([^;,]*);base64,(.*)$/s.exec(url);
-  let data: any;
   let mediaType: string | undefined = typeof imageUrl.mime_type === "string" ? imageUrl.mime_type : undefined;
-  if (m) {
+  if (m && m[1]) mediaType = m[1];
+  let data: any;
+  if (imageUrl.reference && typeof imageUrl.reference === "object") {
+    data = tag === "reference" ? { type: "reference", reference: imageUrl.reference } : imageUrl.reference;
+  } else if (m) {
     data = m[2];
-    if (m[1]) mediaType = m[1];
+    if (tag === "data") data = { type: "data", data: m[2] };
+    else if (tag === "text") data = { type: "text", text: base64ToText(m[2]) };
   } else {
-    data = parseUrl(url) ?? url;
+    const parsed = parseUrl(url);
+    data = parsed ?? url;
+    if (tag === "url") data = { type: "url", url: parsed ?? url };
   }
   const isFile = imageUrl.part === "file" || (mediaType !== undefined && !mediaType.startsWith("image/"));
   if (isFile) {
@@ -370,6 +440,22 @@ function vercelMediaPart(imageUrl: any): any {
   const part: any = { type: "image", image: data };
   if (mediaType) part.mediaType = mediaType;
   return part;
+}
+
+// Collapse runs of adjacent text parts into one text joined with "\n" (the pre-existing
+// representation of multi-part assistant text), keeping media parts in place.
+function groupAssistantParts(parts: ContentPart[]): Array<{ text: string } | { image_url: any }> {
+  const out: Array<{ text: string } | { image_url: any }> = [];
+  for (const p of parts) {
+    if (p.type === "text") {
+      const last = out[out.length - 1];
+      if (last && "text" in last) last.text += "\n" + p.text;
+      else out.push({ text: p.text });
+    } else if (p.type === "image_url") {
+      out.push({ image_url: p.image_url });
+    }
+  }
+  return out;
 }
 
 export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
@@ -705,9 +791,9 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
       if (typeof msg.content === "string") {
         if (msg.content) parts.push({ text: msg.content });
       } else if (Array.isArray(msg.content)) {
-        for (const p of msg.content) {
-          if (p.type === "text") parts.push({ text: p.text });
-          else if (p.type === "image_url") parts.push(geminiMediaPart(p.image_url));
+        for (const g of groupAssistantParts(msg.content)) {
+          if ("text" in g) parts.push({ text: g.text });
+          else parts.push(geminiMediaPart(g.image_url));
         }
       }
       if (msg.tool_calls) {
