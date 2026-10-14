@@ -120,9 +120,8 @@ fn store_only_populated_after_token_gate_admits() {
 
 #[test]
 fn lossless_json_minification_stays_valid_without_a_retrieval_obligation() {
-    let fields: serde_json::Map<String, Value> = (0..500)
-        .map(|i| (format!("field_{i}"), json!(i)))
-        .collect();
+    let fields: serde_json::Map<String, Value> =
+        (0..500).map(|i| (format!("field_{i}"), json!(i))).collect();
     let value = json!([fields]);
     let payload = serde_json::to_string_pretty(&value).unwrap();
     let body = body_with_payload(&payload);
