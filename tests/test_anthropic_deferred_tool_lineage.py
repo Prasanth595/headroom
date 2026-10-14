@@ -7,6 +7,11 @@ the turn after a load started a new lineage at frozen=0, the pipeline re-ran
 the whole history, and history it had forwarded verbatim came out compressed:
 different bytes, so the provider re-wrote the message tier.
 
+Where the deferred tools reach the provider eagerly (a third-party upstream
+gets them with ``defer_loading`` stripped, a translating backend as plain
+functions), a load does change the provider's key, so it must still start a
+new lineage.
+
 The upstream below models Anthropic's prompt cache over the bytes the handler
 forwards, deferred tools left out of the key, so the assertions are on what
 the provider would do with them.
@@ -17,6 +22,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,6 +32,7 @@ pytest.importorskip("fastapi")
 import httpx
 from fastapi.testclient import TestClient
 
+from headroom.backends.base import BackendResponse
 from headroom.cache.prefix_tracker import PrefixCacheTracker, cache_key_tools
 from headroom.proxy.helpers import reset_deferred_orphan_warn_state
 from headroom.proxy.server import ProxyConfig, create_app
@@ -51,6 +58,7 @@ PLACEHOLDER = {
 TOOLS = [READ, TOOL_SEARCH, PLACEHOLDER]
 LOADED = {"name": "mcp__docs__search", "input_schema": {"type": "object"}, "defer_loading": True}
 EAGER = {"name": "WebFetch", "input_schema": {"type": "object"}}
+THIRD_PARTY_URL = "https://gateway.example.com/anthropic"
 
 
 def _strip(obj: Any) -> Any:
@@ -147,7 +155,12 @@ class _PromptCache:
         return sum(tokens[: hit + 1]), sum(tokens[hit + 1 :])
 
 
-def _drive(requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]) -> list[dict]:
+def _drive(
+    requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]],
+    *,
+    api_url: str | None = None,
+    backend: bool = False,
+) -> list[dict]:
     """Send (tools, messages) through the real handler; record each request's
     resolved tracker, its frozen count, what was forwarded and the provider's
     cache read and write."""
@@ -159,6 +172,7 @@ def _drive(requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]) ->
             rate_limit_enabled=False,
             cost_tracking_enabled=False,
             log_requests=False,
+            anthropic_api_url=api_url,
         )
     )
     cache = _PromptCache()
@@ -201,7 +215,14 @@ def _drive(requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]) ->
         async def _upstream(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN003
             return httpx.Response(200, json=_reply(body))
 
+        async def _backend_send(body, headers):  # noqa: ANN001, ANN202
+            # A translating backend sends every tool as a plain function.
+            tools = [{k: v for k, v in t.items() if k != "defer_loading"} for t in body["tools"]]
+            return BackendResponse(body=_reply({**body, "tools": tools}), status_code=200)
+
         proxy._retry_request = _upstream
+        if backend:
+            proxy.anthropic_backend = SimpleNamespace(name="litellm", send_message=_backend_send)
         for tools, messages in requests:
             response = client.post(
                 "/v1/messages",
@@ -219,13 +240,13 @@ def _drive(requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]) ->
     return seen
 
 
-def _session(added: dict[str, Any]) -> tuple[dict, dict]:
+def _session(added: dict[str, Any], **upstream: Any) -> tuple[dict, dict]:
     turns = [(TOOLS, _history(n)) for n in range(1, 10)]
     if added is LOADED:
         turns.append(([*TOOLS, added], _after_tool_search(9)))
     else:
         turns.append(([*TOOLS, added], _history(10)))
-    seen = _drive(turns)
+    seen = _drive(turns, **upstream)
     return seen[-2], seen[-1]
 
 
@@ -258,6 +279,22 @@ def test_deferred_tool_load_keeps_the_lineage_and_its_cached_prefix(caplog) -> N
     assert after["tools"][-1] == LOADED
     assert after["forwarded"][-1]["content"][0]["content"][0]["tool_name"] == LOADED["name"]
     assert not [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [{"api_url": THIRD_PARTY_URL}, {"backend": True}],
+    ids=["third-party-upstream", "translating-backend"],
+)
+def test_deferred_tool_load_sent_eagerly_starts_a_new_lineage(upstream) -> None:  # noqa: ANN001
+    before, after = _session(LOADED, **upstream)
+
+    assert after["tracker"] is not before["tracker"]
+    assert after["frozen"] == 0
+    # The provider got the loaded tool eagerly, so its key changed anyway:
+    # nothing of the old prefix was readable to keep.
+    assert not any(t.get("defer_loading") for t in after["tools"])
+    assert after["read"] == 0
 
 
 def test_kill_switch_keys_deferred_tools_again(monkeypatch) -> None:  # noqa: ANN001
