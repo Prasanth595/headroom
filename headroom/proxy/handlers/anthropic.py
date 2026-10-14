@@ -438,14 +438,16 @@ class AnthropicHandlerMixin:
 
         First-party Anthropic only: a gateway's event stream is not something
         the fold has been checked against. Kill switch:
-        ``HEADROOM_BUFFERED_UPSTREAM_STREAM=0``.
+        ``HEADROOM_BUFFERED_UPSTREAM_STREAM=0``, a runtime-env knob, so
+        ``headroom wrap`` also pushes it to a reused proxy.
         """
         from headroom.providers.claude.runtime import is_custom_anthropic_base_url
+        from headroom.proxy import runtime_env
 
         if (
             body.get("stream")
             or is_custom_anthropic_base_url(url)
-            or os.environ.get("HEADROOM_BUFFERED_UPSTREAM_STREAM", "1").strip().lower()
+            or runtime_env.getenv("HEADROOM_BUFFERED_UPSTREAM_STREAM", "1").strip().lower()
             in ("0", "false", "no", "off")
         ):
             return await send(headers, body)

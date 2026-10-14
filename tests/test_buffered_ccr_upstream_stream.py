@@ -295,6 +295,27 @@ async def test_requests_it_should_not_touch_go_out_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_a_propagated_kill_switch_keeps_the_request_non_streaming(proxy) -> None:
+    # `headroom wrap` pushes this knob to a reused proxy, so the rollback works
+    # without the proxy's own environment or a restart.
+    from headroom.proxy import runtime_env
+
+    assert runtime_env.explicit_env({"HEADROOM_BUFFERED_UPSTREAM_STREAM": "0"}) == {
+        "HEADROOM_BUFFERED_UPSTREAM_STREAM": "0"
+    }
+    upstream = _Upstream(_stream_reply(*_text_turn("hello")))
+    body = {"model": "m", "stream": False, "messages": []}
+    runtime_env.set_overrides({"HEADROOM_BUFFERED_UPSTREAM_STREAM": "0"})
+    try:
+        response = await _send(proxy, upstream, body=body)
+    finally:
+        runtime_env.clear_overrides()
+
+    assert upstream.calls == [({"Accept": "application/json", "x-api-key": "k"}, body)]
+    assert response.json()["via"] == "json"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "reply",
     [
