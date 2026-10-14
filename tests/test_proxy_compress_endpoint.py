@@ -20,8 +20,13 @@ from headroom.proxy.server import ProxyConfig, create_app
 
 
 @pytest.fixture
-def client():
+def client(request, monkeypatch):
     """Create test client with optimization enabled."""
+    if hasattr(request, "param"):
+        from headroom.proxy import helpers
+
+        monkeypatch.setattr(helpers, "MAX_REQUEST_BODY_SIZE", request.param)
+        monkeypatch.setattr(helpers, "MAX_DECOMPRESSED_BODY_SIZE", request.param)
     config = ProxyConfig(
         optimize=True,
         cache_enabled=False,
@@ -85,7 +90,10 @@ class TestCompressEndpointValidation:
         assert data["error"]["type"] == "invalid_request"
 
     @pytest.mark.parametrize("bypass", [False, True])
-    def test_expanded_image_history_is_refused_before_compression(self, client, bypass):
+    @pytest.mark.parametrize("client", [64 * 1024], indirect=True)
+    def test_expanded_image_history_is_refused_before_compression(
+        self, client, bypass, monkeypatch
+    ):
         body = {
             "model": "gpt-4o",
             "messages": [
@@ -94,14 +102,17 @@ class TestCompressEndpointValidation:
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "data:image/png;base64," + "YQ==" * (5 * 1024 * 1024)
-                            },
+                            "image_url": {"url": "data:image/png;base64," + "YQ==" * (32 * 1024)},
                         }
                     ],
                 }
             ],
         }
+
+        async def no_compression(*args, **kwargs):
+            pytest.fail("oversized history reached compression")
+
+        monkeypatch.setattr(client.app.state.proxy, "_run_compression_in_executor", no_compression)
         headers = {"content-type": "application/json", "content-encoding": "gzip"}
         if bypass:
             headers["x-headroom-bypass"] = "true"
