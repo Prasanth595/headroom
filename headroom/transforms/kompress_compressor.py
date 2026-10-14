@@ -1404,6 +1404,13 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         thread.start()
 
 
+def is_kompress_load_in_progress(model_id: str = HF_MODEL_ID) -> bool:
+    """True while a registered thread (prefetch, download or warm-up) is working on ``model_id``."""
+    with _download_threads_lock:
+        thread = _download_threads.get(model_id)
+    return thread is not None and thread.is_alive()
+
+
 def start_kompress_warmup_thread(model_id: str, warm: Callable[[], None]) -> threading.Thread:
     """Run ``warm`` on a daemon ``kompress-warmup`` thread registered as ``model_id``'s loader.
 
@@ -1836,6 +1843,10 @@ class KompressCompressor(Transform):
         No-op when the model is already cached or a download is already running.
         """
         ensure_background_download(self.config.model_id, self.config.device)
+
+    def is_loading(self) -> bool:
+        """True while a background thread is fetching or loading this model."""
+        return is_kompress_load_in_progress(self.config.model_id)
 
     def compress(
         self,
