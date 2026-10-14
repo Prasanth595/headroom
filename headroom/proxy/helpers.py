@@ -3404,6 +3404,11 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
             "Request body must be a JSON object, not " + type(result).__name__
         )
 
+    # Large histories are routed from their envelope only. Leave their content
+    # untouched for the soft-limit passthrough, before any normalization/copies.
+    if len(raw) > request_limit_policy.COMPRESSION_BODY_MAX_BYTES:
+        return result, raw
+
     # Drop output-only blocks (see ``strip_output_only_request_blocks``) before
     # any downstream deepcopy / compression / 400-retry path. This is the shared
     # reader for the Anthropic, OpenAI, and Bedrock handlers, so one guard here

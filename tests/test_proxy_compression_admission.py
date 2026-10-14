@@ -1,75 +1,17 @@
-"""Large histories must be refused before their bodies enter preprocessing."""
+"""Whole-history admission and compression passthrough behavior."""
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import subprocess
 import sys
 import textwrap
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-
-from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("declared", [True, False])
-async def test_image_heavy_history_is_refused_before_json_preprocessing(declared: bool) -> None:
-    image = "data:image/png;base64," + "YQ==" * (80 * 1024)
-    body = json.dumps(
-        {
-            "model": "gpt-4o",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "image_url", "image_url": {"url": image}}],
-                }
-                for _ in range(64)
-            ],
-        }
-    ).encode()
-    sent = []
-    offset = 0
-    buffered = bytearray()
-    chunk_size = 64 * 1024
-
-    async def receive():
-        nonlocal offset
-        chunk = body[offset : offset + chunk_size]
-        offset += len(chunk)
-        return {"type": "http.request", "body": chunk, "more_body": offset < len(body)}
-
-    async def send(message):
-        sent.append(message)
-
-    async def preprocessing(scope, receive, send):
-        while True:
-            message = await receive()
-            buffered.extend(message["body"])
-            if not message["more_body"]:
-                break
-        json.loads(buffered)
-        await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b"accepted"})
-
-    headers = [(b"content-type", b"application/json")]
-    if declared:
-        headers.append((b"content-length", str(len(body)).encode()))
-    scope = {"type": "http", "method": "POST", "path": "/v1/compress", "headers": headers}
-    await RequestBodyLimitMiddleware(preprocessing)(scope, receive, send)
-
-    assert [message["status"] for message in sent if message["type"] == "http.response.start"] == [
-        413
-    ]
-    error = json.loads(sent[-1]["body"])
-    assert error["error"]["code"] == "request_too_large"
-    if declared:
-        assert offset == 0
-        assert buffered == b""
-    else:
-        assert offset < len(body)
-        assert len(buffered) < offset
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "not-int", "1.5"])
@@ -124,3 +66,135 @@ def test_startup_override_changes_http_admission_after_restart() -> None:
     assert results[0]["status"] == 413
     assert results[0]["body"]["error"]["code"] == "request_too_large"
     assert results[1] == {"status": 200, "body": {"preprocessed": True}}
+
+
+@pytest.fixture
+def admitted_proxy(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy import request_limit_policy
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setattr(request_limit_policy, "COMPRESSION_BODY_MAX_BYTES", 1024)
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["content-length"]))
+            response = json.dumps(
+                {
+                    "id": "msg_admission",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 101, "output_tokens": 1},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    config = ProxyConfig(
+        anthropic_api_url=f"http://127.0.0.1:{provider.server_port}",
+        openai_api_url=f"http://127.0.0.1:{provider.server_port}",
+        gemini_api_url=f"http://127.0.0.1:{provider.server_port}",
+        bedrock_api_url=f"http://127.0.0.1:{provider.server_port}",
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        stateless=True,
+        disable_kompress=True,
+    )
+    try:
+        with TestClient(
+            create_app(config),
+            base_url="http://127.0.0.1",
+            client=("127.0.0.1", 50000),
+        ) as client:
+            yield client
+    finally:
+        provider.shutdown()
+        provider.server_close()
+        thread.join()
+
+
+def test_gzip_history_above_soft_threshold_stays_live_without_claiming_savings(admitted_proxy):
+    raw = json.dumps(
+        {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "history " * 3000}],
+        }
+    ).encode()
+    encoded = gzip.compress(raw)
+    assert len(encoded) < 1024 < len(raw)
+    response = admitted_proxy.post(
+        "/v1/messages",
+        content=encoded,
+        headers={"content-type": "application/json", "content-encoding": "gzip"},
+    )
+    assert response.status_code == 200
+    assert response.json()["content"] == [{"type": "text", "text": "ok"}]
+    stats = admitted_proxy.get("/stats").json()
+    assert stats["tokens"]["input_provider_reported"] == 101
+    assert stats["tokens"]["output"] == 1
+    assert stats["tokens"]["proxy_attempted_tokens"] == 0
+    assert stats["tokens"]["saved"] == 0
+    assert admitted_proxy.get("/livez").status_code == 200
+    following = admitted_proxy.post(
+        "/v1/messages",
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "next turn"}],
+        },
+    )
+    assert following.status_code == 200
+    assert admitted_proxy.get("/stats").json()["requests"]["failed"] == 0
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/messages",
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1beta/models/gemini-2.5-flash:generateContent",
+        "/model/anthropic.claude-v2/invoke",
+    ],
+)
+def test_soft_passthrough_still_obeys_decompressed_hard_ceiling(admitted_proxy, monkeypatch, path):
+    from headroom.proxy import helpers
+
+    monkeypatch.setattr(helpers, "MAX_DECOMPRESSED_BODY_SIZE", 8192)
+    monkeypatch.setattr(helpers, "MAX_REQUEST_BODY_SIZE", 8192)
+    content = "history " * 3000
+    body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": content}],
+    }
+    if path == "/v1/responses":
+        body = {"model": "gpt-4o", "input": content}
+    elif "/models/" in path:
+        body = {"contents": [{"role": "user", "parts": [{"text": content}]}]}
+    elif "/model/" in path:
+        body["anthropic_version"] = "bedrock-2023-05-31"
+    raw = json.dumps(body).encode()
+    response = admitted_proxy.post(
+        path,
+        content=gzip.compress(raw),
+        headers={"content-type": "application/json", "content-encoding": "gzip"},
+    )
+    assert response.status_code == 413
+    assert admitted_proxy.get("/livez").status_code == 200
