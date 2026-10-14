@@ -22,12 +22,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Ask git for the effective hooks directory. In a linked worktree `.git` is a
-# file and hooks live in the shared common dir, so `.git/hooks` doesn't exist.
-if ! HOOKS_DIR="$(git rev-parse --git-path hooks 2>/dev/null)"; then
-    echo "error: not inside a git checkout — run from a Headroom git checkout" >&2
+# Install only into the checkout this script belongs to. A source copy nested
+# inside another repository would otherwise resolve that repository's hooks.
+if [[ "$(git rev-parse --show-toplevel 2>/dev/null)" != "$(pwd -P)" ]]; then
+    echo "error: $(pwd -P) is not the root of a git checkout — run from a Headroom git checkout" >&2
     exit 1
 fi
+
+# Ask git for the effective hooks directory. In a linked worktree `.git` is a
+# file and hooks live in the shared common dir, so `.git/hooks` doesn't exist.
+HOOKS_DIR="$(git rev-parse --git-path hooks)"
 mkdir -p "$HOOKS_DIR"
 
 if ! command -v npx &>/dev/null; then
