@@ -405,6 +405,12 @@ constraint-dependencies = [
     "aiohttp>=3.14.3",
     # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
     "cryptography>=50.0.0",
+    # Not a CVE: before 1.6.0, hf-xet's worker threads could re-enter or
+    # re-initialize Python while the interpreter shut down after a Hub
+    # download, aborting the process at exit (SIGSEGV in Py_InitializeEx, or
+    # a fatal TstateNULL error). 1.6.0 dropped pyo3's `auto-initialize`, and
+    # 1.5.1 fixed the progress thread. Transitive via huggingface-hub.
+    "hf-xet>=1.6.0",
 ]
 
 # Pin the project's package index to public PyPI. Without this, `uv lock`
