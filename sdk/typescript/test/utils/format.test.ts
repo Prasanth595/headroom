@@ -7,6 +7,8 @@ import {
   geminiToOpenAI,
   openAIToGemini,
   fromOpenAI,
+  detectFormat,
+  toOpenAI,
 } from "../../src/utils/format.js";
 import type { OpenAIMessage } from "../../src/types.js";
 
@@ -1281,7 +1283,7 @@ describe("assistant text separators across formats", () => {
     expect(openAIToAnthropic(msgs)).toEqual([{ role: "assistant", content: "first\nsecond" }]);
   });
 
-  it("openAIToAnthropic keeps text runs around media as single blocks in order", () => {
+  it("openAIToAnthropic keeps text parts separate when the array carries media", () => {
     const msgs = [
       {
         role: "assistant",
@@ -1297,7 +1299,8 @@ describe("assistant text separators across formats", () => {
       {
         role: "assistant",
         content: [
-          { type: "text", text: "a\nb" },
+          { type: "text", text: "a" },
+          { type: "text", text: "b" },
           { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw==" } },
           { type: "text", text: "c" },
         ],
@@ -1305,10 +1308,74 @@ describe("assistant text separators across formats", () => {
     ]);
   });
 
+  it("round-trips Gemini and Anthropic assistant turns with two adjacent text parts before media exactly", () => {
+    const gemini = [
+      { role: "model", parts: [{ text: "Hello " }, { text: "world" }, { inlineData: { mimeType: "image/png", data: "iVBORw==" } }] },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(gemini))).toEqual(gemini);
+    const anthropic = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Hello " },
+          { type: "text", text: "world" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw==" } },
+        ],
+      },
+    ];
+    expect(openAIToAnthropic(anthropicToOpenAI(anthropic))).toEqual(anthropic);
+  });
+
   it("openAIToGemini joins adjacent assistant text parts with a newline into one part", () => {
     const msgs = [
       { role: "assistant", content: [{ type: "text", text: "first" }, { type: "text", text: "second" }] },
     ] as OpenAIMessage[];
     expect(openAIToGemini(msgs)).toEqual([{ role: "model", parts: [{ text: "first\nsecond" }] }]);
+  });
+});
+
+describe("Anthropic user document blocks", () => {
+  it("keeps a user document (PDF) beside its text as an image_url data URI", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize" },
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize" },
+          { type: "image_url", image_url: { url: "data:application/pdf;base64,JVBERi0=" } },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps a document-only user turn instead of dropping it", () => {
+    const result = anthropicToOpenAI([
+      { role: "user", content: [{ type: "document", source: { type: "url", url: "https://example.com/a.pdf" } }] },
+    ]);
+    expect(result).toEqual([
+      { role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.pdf", mime_type: "application/pdf" } }] },
+    ]);
+  });
+
+  it("round-trips a user text+document turn exactly through detection and conversion", () => {
+    const original = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize" },
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } },
+        ],
+      },
+    ];
+    expect(detectFormat(original)).toBe("anthropic");
+    expect(fromOpenAI(toOpenAI(original), "anthropic")).toEqual(original);
   });
 });

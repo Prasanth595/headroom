@@ -140,15 +140,15 @@ export function anthropicToOpenAI(messages: any[]): OpenAIMessage[] {
       }
       if (Array.isArray(msg.content)) {
         const toolResults = msg.content.filter((b: any) => b.type === "tool_result");
-        const hasImages = msg.content.some((b: any) => b.type === "image");
+        const hasMedia = msg.content.some((b: any) => b.type === "image" || b.type === "document");
 
-        if (hasImages) {
+        if (hasMedia) {
           const parts = msg.content
-            .filter((b: any) => b.type === "text" || b.type === "image")
+            .filter((b: any) => b.type === "text" || b.type === "image" || b.type === "document")
             .map((b: any) => {
               if (b.type === "text") return { type: "text" as const, text: b.text };
-              const url = anthropicImageUrl(b.source);
-              return url ? { type: "image_url" as const, image_url: { url } } : null;
+              const imageUrl = anthropicMediaImageUrl(b);
+              return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
             })
             .filter((p: any): p is NonNullable<typeof p> => p !== null);
 
@@ -442,18 +442,20 @@ function vercelMediaPart(imageUrl: any): any {
   return part;
 }
 
-// Collapse runs of adjacent text parts into one text joined with "\n" (the pre-existing
-// representation of multi-part assistant text), keeping media parts in place.
+// Assistant content parts for the Anthropic / Gemini reverse converters. A text-only array
+// collapses to one text joined with "\n" (the forward converters join text-only turns the same
+// way); an array carrying media keeps every part separate, because the forward converters keep
+// the exact parts in that case and a round trip must not add or move characters.
 function groupAssistantParts(parts: ContentPart[]): Array<{ text: string } | { image_url: any }> {
+  const hasMedia = parts.some((p) => p.type === "image_url");
+  if (!hasMedia) {
+    const text = parts.filter((p) => p.type === "text").map((p) => (p as any).text).join("\n");
+    return text ? [{ text }] : [];
+  }
   const out: Array<{ text: string } | { image_url: any }> = [];
   for (const p of parts) {
-    if (p.type === "text") {
-      const last = out[out.length - 1];
-      if (last && "text" in last) last.text += "\n" + p.text;
-      else out.push({ text: p.text });
-    } else if (p.type === "image_url") {
-      out.push({ image_url: p.image_url });
-    }
+    if (p.type === "text") out.push({ text: p.text });
+    else if (p.type === "image_url") out.push({ image_url: p.image_url });
   }
   return out;
 }
