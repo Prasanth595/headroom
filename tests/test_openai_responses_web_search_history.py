@@ -184,19 +184,22 @@ _CODEX_HEADERS = {
 }
 
 
-def _post(body_bytes: bytes, *, stream: bool) -> tuple[bytes, list[str]]:
+def _post(
+    body_bytes: bytes, *, stream: bool, extra_headers: dict[str, str] | None = None
+) -> tuple[bytes, list[str]]:
+    headers = {**_CODEX_HEADERS, **(extra_headers or {})}
     client, transport = _make_no_optimize_app()
     proxy_logger, handler, prev_level, records = _start_proxy_log_capture()
     try:
         if stream:
             with client.stream(
-                "POST", "/v1/responses", headers=_CODEX_HEADERS, content=body_bytes
+                "POST", "/v1/responses", headers=headers, content=body_bytes
             ) as response:
                 assert response.status_code == 200
                 for _ in response.iter_bytes():
                     pass
         else:
-            response = client.post("/v1/responses", headers=_CODEX_HEADERS, content=body_bytes)
+            response = client.post("/v1/responses", headers=headers, content=body_bytes)
             assert response.status_code == 200, response.text
     finally:
         _stop_proxy_log_capture(proxy_logger, handler, prev_level)
@@ -237,6 +240,17 @@ def test_http_unaffected_request_is_forwarded_byte_identical(body: dict[str, Any
     assert not any("event=web_search_history" in m for m in logs)
 
 
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "buffered"])
+def test_http_bypass_request_is_forwarded_byte_identical(stream: bool) -> None:
+    # A bypass client asked Headroom to stay out of its bytes, so even a body
+    # the backend will refuse goes out exactly as sent.
+    body_bytes = json.dumps(_compaction_body(stream=stream), indent=2).encode()
+    sent, logs = _post(body_bytes, stream=stream, extra_headers={"x-headroom-bypass": "true"})
+
+    assert sent == body_bytes
+    assert not any("event=web_search_history" in m for m in logs)
+
+
 # --- Codex WebSocket /v1/responses ------------------------------------------
 
 
@@ -266,6 +280,33 @@ async def test_ws_first_frame_reaches_upstream_without_web_search_calls() -> Non
         "message",
         "message",
     ]
+
+
+@pytest.mark.asyncio
+async def test_ws_bypass_session_frames_reach_upstream_unchanged() -> None:
+    compaction = _frame(_compaction_body())
+    upstream = _FakeUpstream([], hold_after_events=True)
+    client_ws = _FakeWebSocket(
+        frames=[compaction, compaction],
+        headers={"authorization": "Bearer test", "x-headroom-bypass": "true"},
+        hold_after_initial=True,
+    )
+
+    async def _disconnect_soon() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        trigger = asyncio.create_task(_disconnect_soon())
+        try:
+            await asyncio.wait_for(
+                _DummyOpenAIHandler().handle_openai_responses_ws(client_ws), timeout=2.0
+            )
+        finally:
+            trigger.cancel()
+
+    # First frame and a later frame both go out as the client sent them.
+    assert upstream.sent == [compaction, compaction]
 
 
 @pytest.mark.asyncio

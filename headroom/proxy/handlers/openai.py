@@ -1108,8 +1108,10 @@ def _drop_undeclared_web_search_calls(
     live server-side.
 
     Mutates *payload* in place and returns the number of items dropped
-    (0 = untouched). Disable with ``HEADROOM_WEB_SEARCH_HISTORY=0``. Remove
-    once the backend accepts such a body.
+    (0 = untouched). Callers skip it for a bypass request
+    (``x-headroom-bypass: true``), which asked for its bytes untouched.
+    Disable with ``HEADROOM_WEB_SEARCH_HISTORY=0``. Remove once the backend
+    accepts such a body.
     """
     items = payload.get("input")
     if not isinstance(items, list) or payload.get("previous_response_id"):
@@ -5680,7 +5682,8 @@ class OpenAIHandlerMixin:
         #
         # Before anything reads `input`: drop web_search_call history from a
         # request that declares no web_search tool (Codex local compaction).
-        if _drop_undeclared_web_search_calls(body, request_id=request_id):
+        # A bypass request asked for its bytes untouched, so it is left alone.
+        if not _bypass and _drop_undeclared_web_search_calls(body, request_id=request_id):
             body_mutation_tracker.mark_mutated("responses_web_search_history")
         input_data = body.get("input", "")
         instructions = body.get("instructions")
@@ -7539,6 +7542,14 @@ class OpenAIHandlerMixin:
                     model or "unknown",
                 )
 
+            # Resolved before the frame helpers below, which read it.
+            _ws_bypass = self._headroom_bypass_enabled(ws_headers)
+            if _ws_bypass:
+                logger.info(
+                    "[%s] WS /v1/responses passthrough reason=bypass_header mutation=disabled",
+                    request_id,
+                )
+
             def _normalize_ws_response_create_for_upstream(raw_msg: str) -> str:
                 """Optionally flatten Codex WS response.create frames for gateways.
 
@@ -7551,11 +7562,13 @@ class OpenAIHandlerMixin:
                 the HTTP fallback also replays, later frames, memory
                 continuations) passes through here, so it also drops
                 web_search_call history the frame declares no tool for (see
-                ``_drop_undeclared_web_search_calls``).
+                ``_drop_undeclared_web_search_calls``), except on a bypass
+                session, whose frames stay as the client sent them.
                 """
-                raw_msg = _drop_undeclared_web_search_calls_from_frame(
-                    raw_msg, request_id=request_id
-                )
+                if not _ws_bypass:
+                    raw_msg = _drop_undeclared_web_search_calls_from_frame(
+                        raw_msg, request_id=request_id
+                    )
                 if os.environ.get(
                     "HEADROOM_OPENAI_WS_FLATTEN_RESPONSE_CREATE", ""
                 ).strip().lower() not in (
@@ -7645,12 +7658,6 @@ class OpenAIHandlerMixin:
             ws_recorded_compression_timing_totals: dict[str, float] = {}
             ws_ttfb_ms: float | None = None
             ws_recorded_ttfb_ms = False
-            _ws_bypass = self._headroom_bypass_enabled(ws_headers)
-            if _ws_bypass:
-                logger.info(
-                    "[%s] WS /v1/responses passthrough reason=bypass_header mutation=disabled",
-                    request_id,
-                )
 
             capture_codex_wire_debug(
                 "ws_inbound_first_frame",
