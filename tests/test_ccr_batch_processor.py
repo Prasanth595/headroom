@@ -9,6 +9,7 @@ These tests verify that:
 """
 
 import json
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -585,58 +586,77 @@ class TestContinuationCalls:
         assert call_args.kwargs["json"]["model"] == "gpt-4"
 
     @pytest.mark.asyncio
-    async def test_google_batch_continues_with_native_tool_declarations(self, monkeypatch):
+    @pytest.mark.parametrize("client_tools", ["functions", "siblings", "none"])
+    async def test_google_batch_create_to_results_retains_injected_native_tools(
+        self, monkeypatch, tmp_path, client_tools
+    ):
+        from starlette.requests import Request
+
+        from headroom.providers.openai import OpenAIProvider
+        from headroom.proxy.server import HeadroomProxy, ProxyConfig
+        from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+        from headroom.transforms.pipeline import TransformPipeline
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        original_records = [
+            f"Record {i}: amount={i * 13}, owner=account-{i}, unique source information "
+            "with a detailed transaction description."
+            for i in range(200)
+        ]
+        original = json.dumps(original_records, indent=2)
         store = CompressionStore(enable_feedback=False)
-        original = json.dumps([{"id": 1, "value": "one"}, {"id": 2, "value": "two"}])
-        hash_key = store.store(original, "[]", original_item_count=2)
         previous_store = compression_store_module._request_ccr_store.get()
         set_request_compression_store(store)
-        batch_store = BatchContextStore()
-        monkeypatch.setattr(batch_store_module, "_batch_context_store", batch_store)
-        tools = [
-            {
-                "functionDeclarations": [
-                    {
-                        "name": CCR_TOOL_NAME,
-                        "description": "Retrieve original records.",
-                        "parameters": {
-                            "type": "OBJECT",
-                            "properties": {"hash": {"type": "STRING"}},
-                            "required": ["hash"],
-                        },
-                    },
-                    {
-                        "name": "lookup",
-                        "description": "Look up one record.",
-                        "parameters": {"type": "OBJECT"},
-                    },
-                ]
-            }
-        ]
-        context = BatchContext(batch_id="native-tools", provider="google")
-        context.add_request(
-            BatchRequestContext(
-                custom_id="request",
-                messages=[{"role": "user", "parts": [{"text": "Use the original records"}]}],
-                tools=tools,
-                model="gemini-2.5-flash",
+        monkeypatch.setattr(batch_store_module, "_batch_context_store", BatchContextStore())
+        tools = [] if client_tools == "none" else [{"googleSearch": {}}, {"codeExecution": {}}]
+        if client_tools == "functions":
+            tools.insert(
+                0,
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "lookup",
+                            "description": "Look up one record.",
+                            "parameters": {"type": "OBJECT"},
+                        }
+                    ]
+                },
             )
-        )
-        await batch_store.store(context)
+        forwarded = None
 
-        def admit_continuation(request):
+        def admit_wire_request(request):
+            nonlocal forwarded
             body = json.loads(request.content)
-            declarations = body.get("tools", [{}])[0].get("functionDeclarations", [])
-            names = {declaration.get("name") for declaration in declarations}
-            results = [
-                part["functionResponse"]
-                for part in body["contents"][-1]["parts"]
+            if request.url.path.endswith(":batchGenerateContent"):
+                forwarded = body["batch"]["input_config"]["requests"]["requests"][0]["request"]
+                return httpx.Response(200, json={"name": "batches/native-tools"})
+            recovered = [
+                part["functionResponse"]["response"].get("original_content")
+                for content in body["contents"]
+                for part in content["parts"]
                 if "functionResponse" in part
             ]
+            declarations = [
+                declaration
+                for tool in body.get("tools", [])
+                for declaration in tool.get("functionDeclarations", [])
+            ]
+            expected_names = (
+                {CCR_TOOL_NAME, "lookup"} if client_tools == "functions" else {CCR_TOOL_NAME}
+            )
             admitted = (
-                names == {CCR_TOOL_NAME, "lookup"}
-                and len(results) == 1
-                and results[0]["response"].get("original_content") == original
+                {declaration.get("name") for declaration in declarations} == expected_names
+                and body.get("tools") == forwarded.get("tools")
+                and all(
+                    all(declaration in declarations for declaration in tool["functionDeclarations"])
+                    if "functionDeclarations" in tool
+                    else tool in body["tools"]
+                    for tool in tools
+                )
+                and any(
+                    isinstance(value, str) and json.loads(value) == original_records
+                    for value in recovered
+                )
             )
             return httpx.Response(
                 200 if admitted else 400,
@@ -646,28 +666,107 @@ class TestContinuationCalls:
                     ]
                 }
                 if admitted
-                else {"error": {"message": "Invalid native tool schema or missing retrieval"}},
+                else {"error": {"message": "Missing effective native tools or original records"}},
             )
 
-        response = {
-            "candidates": [
-                {
-                    "content": {
-                        "role": "model",
-                        "parts": [
-                            {"functionCall": {"name": CCR_TOOL_NAME, "args": {"hash": hash_key}}}
-                        ],
+        proxy = HeadroomProxy(
+            ProxyConfig(
+                optimize=True,
+                cache_enabled=False,
+                rate_limit_enabled=False,
+                cost_tracking_enabled=False,
+                log_requests=False,
+                retry_enabled=False,
+                image_optimize=False,
+            )
+        )
+        proxy.openai_pipeline = TransformPipeline(
+            provider=OpenAIProvider(),
+            transforms=[
+                ContentRouter(
+                    ContentRouterConfig(
+                        skip_user_messages=False,
+                        protect_analysis_context=False,
+                        enable_kompress=False,
+                        smart_crusher_max_items_after_crush=12,
+                        smart_crusher_with_compaction=False,
+                    )
+                )
+            ],
+        )
+        payload = json.dumps(
+            {
+                "batch": {
+                    "input_config": {
+                        "requests": {
+                            "requests": [
+                                {
+                                    "metadata": {"key": "request"},
+                                    "request": {
+                                        "contents": [
+                                            {"role": "user", "parts": [{"text": original}]}
+                                        ],
+                                        "tools": tools,
+                                    },
+                                }
+                            ]
+                        }
                     }
                 }
+            }
+        ).encode()
+        chunks = iter(
+            [
+                {"type": "http.request", "body": payload[:100], "more_body": True},
+                {"type": "http.request", "body": payload[100:], "more_body": False},
             ]
-        }
+        )
+
+        async def receive():
+            return next(chunks, {"type": "http.disconnect"})
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1beta/models/gemini-2.5-flash:batchGenerateContent",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "scheme": "http",
+                "server": ("127.0.0.1", 80),
+            },
+            receive,
+        )
         try:
             async with httpx.AsyncClient(
-                transport=httpx.MockTransport(admit_continuation)
+                transport=httpx.MockTransport(admit_wire_request)
             ) as client:
-                processor = BatchResultProcessor(client)
-                processed = await processor.process_results(
-                    "native-tools",
+                proxy.http_client = client
+                created = await proxy.handle_google_batch_create(request, "gemini-2.5-flash")
+                assert created.status_code == 200
+                hash_key = re.search(
+                    r"(?:<<ccr:|Retrieve (?:more|original): hash=)([a-f0-9]{12,24})",
+                    json.dumps(forwarded),
+                ).group(1)
+                response = {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": CCR_TOOL_NAME,
+                                            "args": {"hash": hash_key},
+                                        }
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+                processed = await BatchResultProcessor(client).process_results(
+                    "batches/native-tools",
                     [{"metadata": {"key": "request"}, "response": response}],
                     "google",
                 )
@@ -676,6 +775,7 @@ class TestContinuationCalls:
             ]
         finally:
             set_request_compression_store(previous_store)
+            proxy._compression_executor.shutdown(wait=True)
 
     @pytest.mark.asyncio
     async def test_continuation_with_tools(self):
