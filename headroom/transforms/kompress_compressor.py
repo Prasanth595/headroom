@@ -857,8 +857,10 @@ def _create_onnx_session(
         raise refused
     if not allow_download and cache_miss:
         raise KompressModelNotCached(model_id) from last_err
+    detail = f": {last_err}" if last_err is not None else ""
     raise FileNotFoundError(
-        f"No loadable ONNX artifact in {model_id}; tried {_onnx_filename_candidates()}"
+        f"No loadable ONNX artifact in {model_id}; "
+        f"tried {_onnx_filename_candidates()}{detail}"
     ) from last_err
 
 
@@ -1177,6 +1179,7 @@ def _load_kompress(
     # Auto mode: preserve stable default behavior. This avoids changing
     # compression quality/perf characteristics for existing installs while
     # allowing opt-in MPS/CoreML experiments via HEADROOM_KOMPRESS_BACKEND.
+    onnx_error: Exception | None = None
     if _is_onnx_available():
         try:
             return _load_kompress_onnx(model_id, use_coreml=False, allow_download=allow_download)
@@ -1186,10 +1189,23 @@ def _load_kompress(
             if not allow_download:
                 raise
         except Exception as e:
+            onnx_error = e
             logger.warning("ONNX load failed for %s, trying PyTorch: %s", model_id, e)
 
     if _is_pytorch_available():
         return _load_kompress_pytorch(model_id, device, allow_download=allow_download)
+
+    if onnx_error is not None:
+        # onnxruntime IS installed and was tried, but loading failed. The
+        # "requires onnxruntime or torch" message would be a lie that sends the
+        # operator to reinstall extras that are already present (issue #4207:
+        # an unwritable $HOME fails the HuggingFace download, which surfaces as
+        # "No loadable ONNX artifact" and was then reported as a missing
+        # dependency). Re-raise the real error instead, chained so the original
+        # traceback is preserved.
+        raise RuntimeError(
+            f"Kompress ONNX backend failed for {model_id}: {onnx_error}"
+        ) from onnx_error
 
     raise ImportError(
         "Kompress requires onnxruntime or torch. Install with: pip install headroom-ai[proxy]"
