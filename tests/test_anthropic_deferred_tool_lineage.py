@@ -308,6 +308,24 @@ def test_kill_switch_keys_deferred_tools_again(monkeypatch) -> None:  # noqa: AN
     assert after["read"] == 0
 
 
+def test_runtime_env_override_keys_deferred_tools_again() -> None:
+    # `headroom wrap` pushes this knob to a reused proxy, so the rollback
+    # works without the proxy's own environment or a restart.
+    from headroom.proxy import runtime_env
+
+    assert runtime_env.explicit_env({"HEADROOM_DEFERRED_TOOL_AFFINITY": "0"}) == {
+        "HEADROOM_DEFERRED_TOOL_AFFINITY": "0"
+    }
+    runtime_env.set_overrides({"HEADROOM_DEFERRED_TOOL_AFFINITY": "0"})
+    try:
+        before, after = _session(LOADED)
+    finally:
+        runtime_env.clear_overrides()
+
+    assert after["tracker"] is not before["tracker"]
+    assert after["frozen"] == 0
+
+
 def test_eager_tool_still_starts_a_new_lineage() -> None:
     before, after = _session(EAGER)
 
@@ -315,12 +333,10 @@ def test_eager_tool_still_starts_a_new_lineage() -> None:
     assert after["frozen"] == 0
 
 
-def test_cache_key_tools_drops_only_deferred_tools(monkeypatch) -> None:  # noqa: ANN001
+def test_cache_key_tools_drops_only_deferred_tools() -> None:
     undeferred = {**LOADED, "defer_loading": False}
     tools = [READ, LOADED, undeferred]
 
     assert cache_key_tools(tools) == [READ, undeferred]
     assert tools == [READ, LOADED, undeferred]
     assert cache_key_tools(None) is None
-    monkeypatch.setenv("HEADROOM_DEFERRED_TOOL_AFFINITY", "off")
-    assert cache_key_tools(tools) is tools

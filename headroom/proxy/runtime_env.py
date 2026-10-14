@@ -84,6 +84,12 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "int",
         "Max on-disk file size (bytes) the disk-verify fallback will read.",
     ),
+    Knob(
+        "HEADROOM_DEFERRED_TOOL_AFFINITY",
+        "bool",
+        "Keep defer_loading tools out of the Anthropic prefix-tracker lineage key "
+        "(default on; 0 counts them again).",
+    ),
 )
 
 _KNOBS_BY_ENV: dict[str, Knob] = {k.env: k for k in RUNTIME_ENV_KNOBS}

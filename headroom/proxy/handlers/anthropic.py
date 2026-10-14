@@ -1671,9 +1671,13 @@ class AnthropicHandlerMixin:
             affinity_tools = self._tools_for_forwarding(
                 body.get("tools"), preserve_order=preserve_tool_order
             )
+            from headroom.proxy import runtime_env
+
             if (
                 not _third_party_anthropic_upstream
                 and getattr(self, "anthropic_backend", None) is None
+                and runtime_env.getenv("HEADROOM_DEFERRED_TOOL_AFFINITY", "1").strip().lower()
+                not in ("0", "false", "no", "off")
             ):
                 affinity_tools = cache_key_tools(affinity_tools)
             cache_affinity = segment_fingerprint(

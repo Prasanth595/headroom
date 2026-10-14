@@ -543,9 +543,6 @@ def classify_history_relation(
     return _classify_history_canonical(current, previous)
 
 
-_DEFERRED_TOOL_AFFINITY_ENV = "HEADROOM_DEFERRED_TOOL_AFFINITY"
-
-
 def cache_key_tools(tools: Any) -> Any:
     """The Anthropic ``tools`` that count toward the prompt-cache key.
 
@@ -554,12 +551,10 @@ def cache_key_tools(tools: Any) -> Any:
     Code appends every tool its ToolSearch loads to ``tools``, still marked
     deferred; counting those would start a new lineage at frozen=0 after each
     load and re-run the whole history. Every other tool, and a tool whose
-    ``defer_loading`` is cleared, still counts.
-    ``HEADROOM_DEFERRED_TOOL_AFFINITY=0`` counts every tool again.
+    ``defer_loading`` is cleared, still counts. The Anthropic handler decides
+    when to apply this (first-party upstream, ``HEADROOM_DEFERRED_TOOL_AFFINITY``).
     """
-    if not isinstance(tools, list) or os.environ.get(
-        _DEFERRED_TOOL_AFFINITY_ENV, ""
-    ).strip().lower() in ("0", "false", "no", "off"):
+    if not isinstance(tools, list):
         return tools
     return [t for t in tools if not (isinstance(t, dict) and t.get("defer_loading"))]
 
