@@ -1155,9 +1155,11 @@ def _drop_undeclared_web_search_calls_from_frame(
 
     Returns *raw_msg* unchanged (same object) unless items were dropped. The
     substring prescreen keeps every frame without a ``web_search_call`` from
-    paying a parse.
+    paying a parse. JSON can spell the type with ``\\uXXXX`` escapes
+    (``"web_search\\u005fcall"``), and a letter or underscore can only be
+    escaped that way, so a frame holding any ``\\u`` is parsed too.
     """
-    if '"web_search_call"' not in raw_msg:
+    if '"web_search_call"' not in raw_msg and "\\u" not in raw_msg:
         return raw_msg
     try:
         frame = json.loads(raw_msg)

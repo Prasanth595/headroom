@@ -174,6 +174,29 @@ def test_frame_helper_returns_the_same_string_unless_it_drops() -> None:
         assert _drop_undeclared_web_search_calls_from_frame(raw) is raw
 
 
+def test_frame_helper_decodes_escaped_type_spellings() -> None:
+    # json.loads reads "web_search_call" as web_search_call, and so does
+    # the backend, so the prescreen must not skip it.
+    escaped = (
+        '{"type":"response.create","response":{"input":'
+        '[{"type":"web_search\\u005fcall","id":"ws_1"}],"tools":[]}}'
+    )
+    assert json.loads(escaped)["response"]["input"][0]["type"] == "web_search_call"
+    assert json.loads(_drop_undeclared_web_search_calls_from_frame(escaped))["response"] == {
+        "input": [],
+        "tools": [],
+    }
+
+    # Escapes alone change nothing: declared tool, no search history.
+    for raw in (
+        '{"type":"response.create","response":{"input":'
+        '[{"type":"web_search\\u005fcall","id":"ws_1"}],"tools":[{"type":"web_search"}]}}',
+        '{"type":"response.create","response":{"input":'
+        '[{"type":"message","role":"user","content":"caf\\u00e9"}],"tools":[]}}',
+    ):
+        assert _drop_undeclared_web_search_calls_from_frame(raw) is raw
+
+
 # --- HTTP /v1/responses ----------------------------------------------------
 
 _CODEX_HEADERS = {
@@ -307,6 +330,39 @@ async def test_ws_bypass_session_frames_reach_upstream_unchanged() -> None:
 
     # First frame and a later frame both go out as the client sent them.
     assert upstream.sent == [compaction, compaction]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bypass", [False, True], ids=["normal", "bypass"])
+async def test_ws_escaped_web_search_call_frame(bypass: bool) -> None:
+    escaped = (
+        '{"type":"response.create","response":{"model":"gpt-5-codex","input":'
+        '[{"type":"web_search\\u005fcall","id":"ws_1"}],"tools":[]}}'
+    )
+    headers = {"authorization": "Bearer test"}
+    if bypass:
+        headers["x-headroom-bypass"] = "true"
+    upstream = _FakeUpstream([], hold_after_events=True)
+    client_ws = _FakeWebSocket(frames=[escaped], headers=headers, hold_after_initial=True)
+
+    async def _disconnect_soon() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        trigger = asyncio.create_task(_disconnect_soon())
+        try:
+            await asyncio.wait_for(
+                _DummyOpenAIHandler().handle_openai_responses_ws(client_ws), timeout=2.0
+            )
+        finally:
+            trigger.cancel()
+
+    assert len(upstream.sent) == 1
+    if bypass:
+        assert upstream.sent[0] == escaped
+    else:
+        assert json.loads(upstream.sent[0])["response"]["input"] == []
 
 
 @pytest.mark.asyncio
