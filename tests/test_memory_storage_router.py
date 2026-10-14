@@ -166,6 +166,12 @@ def test_extract_cwd_preserves_vertical_tab_inside_path() -> None:
     assert ProjectResolver._extract_cwd_from_system_prompt(f"cwd: {cwd}\n") == cwd
 
 
+def test_extract_cwd_supports_crlf_line_endings() -> None:
+    prompt = "cwd: /work/current\r\n"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(prompt) == "/work/current"
+
+
 def test_resolver_ignores_incidental_cwd_prose() -> None:
     r = ProjectResolver()
     assert (
