@@ -2037,7 +2037,11 @@ class HeadroomProxy(
                 backend,
             )
 
-        threading.Thread(target=_warm, name="kompress-warmup", daemon=True).start()
+        from headroom.transforms.kompress_compressor import start_kompress_warmup_thread
+
+        # Registered as the model's loader, so a request during the warm-up
+        # doesn't start a second load thread.
+        start_kompress_warmup_thread(compressor.config.model_id, _warm)
         return True
 
     async def startup(self):

@@ -23,7 +23,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal
@@ -1402,6 +1402,29 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         )
         _download_threads[model_id] = thread
         thread.start()
+
+
+def start_kompress_warmup_thread(model_id: str, warm: Callable[[], None]) -> threading.Thread:
+    """Run ``warm`` on a daemon ``kompress-warmup`` thread registered as ``model_id``'s loader.
+
+    The proxy's post-startup warm-up loads the model on its own thread. Unless
+    that thread is in the per-model registry, a request arriving mid-warm-up
+    finds the model not ready, sees no live loader, and has
+    :func:`ensure_background_download` start a second thread that only queues
+    on ``_kompress_lock`` and then returns the warm-up's cache entry. Registered
+    before it starts, so the warm-up's initial delay is covered too.
+
+    Replaces any entry already there. If that was a live prefetch or download
+    thread, it carries on unregistered; the warm-up's own load still serializes
+    behind it on ``_kompress_lock``. Once the warm-up finishes, a failed one
+    included, the next :func:`ensure_background_download` call replaces the
+    dead entry as usual.
+    """
+    thread = threading.Thread(target=warm, name="kompress-warmup", daemon=True)
+    with _download_threads_lock:
+        _download_threads[model_id] = thread
+        thread.start()
+    return thread
 
 
 def prefetch_kompress_artifacts(model_id: str = HF_MODEL_ID) -> bool:
