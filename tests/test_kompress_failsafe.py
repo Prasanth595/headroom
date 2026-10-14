@@ -647,7 +647,11 @@ def test_stage_timings_count_every_candidate_attempt(monkeypatch):
 
 
 def test_onnx_load_logs_every_stage(monkeypatch, caplog):
+    import sys
+    from types import SimpleNamespace
+
     _install_fake_ort(monkeypatch, run_fails_for=set())
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=object()))
     monkeypatch.setattr(kc, "_kompress_cache", {})
     monkeypatch.setattr(
         kc, "_load_modernbert_tokenizer", lambda _auto, *, allow_download: "tokenizer"
