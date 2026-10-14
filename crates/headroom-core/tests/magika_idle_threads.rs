@@ -51,12 +51,13 @@ fn magika_session_does_not_spawn_intra_op_pool() {
     // Apple Neural Engine once ORT 1.31 registers Core ML as a built-in EP,
     // adding 5-7 idle ANE threads (#4191). The control goes through the same
     // EP selection, so measure the allowance there instead of guessing it.
-    let before = settled_thread_count();
+    let start = settled_thread_count();
     let control = magika::Session::builder()
         .with_intra_threads(1)
         .build()
         .expect("build pool-free control session");
-    let allowance = settled_thread_count().saturating_sub(before);
+    let control_alive = settled_thread_count();
+    let allowance = control_alive.saturating_sub(start);
     drop(control);
 
     let before = settled_thread_count();
@@ -66,6 +67,11 @@ fn magika_session_does_not_spawn_intra_op_pool() {
     // (2-4 on macOS), so on a low-core host a pool that small can still hide
     // inside it; a pass there is not proof of no spinning.
     let extra = after.saturating_sub(before);
+    eprintln!(
+        "OS threads: start={start}, control alive={control_alive}, control dropped={before} \
+         ({} kept); magika session added {extra} (allowance {allowance})",
+        before.saturating_sub(start)
+    );
     assert!(
         extra <= allowance,
         "magika session left {extra} extra OS thread(s) running, a pool-free session \

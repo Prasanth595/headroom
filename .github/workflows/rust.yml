@@ -158,6 +158,12 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+      - name: cargo test (magika idle threads)
+        # Cargo stops at the first failing test binary, so a failure elsewhere
+        # in the suite would skip this macOS-specific check (#4191). Run it on
+        # its own even then; --nocapture keeps its thread counts in the log.
+        if: ${{ !cancelled() && matrix.os == 'macos-26' }}
+        run: cargo test -p headroom-core --test magika_idle_threads -- --nocapture
 
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})
