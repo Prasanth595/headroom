@@ -12,6 +12,7 @@ folded back into the Message the buffered path reads.
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any
 
@@ -164,9 +165,15 @@ EVERY_DELTA = [
 # --------------------------------------------------------------------------- #
 def test_fold_matches_the_anthropic_sdk_accumulator() -> None:
     streaming = pytest.importorskip("anthropic.lib.streaming._messages")
+    accumulate = streaming.accumulate_event
+    # anthropic 1.x keeps each tool block's partial JSON in a buffer the caller
+    # owns (``json_bufs``); 0.x kept it on the block. Same accumulation either way.
+    buffers: dict[str, Any] = (
+        {"json_bufs": {}} if "json_bufs" in inspect.signature(accumulate).parameters else {}
+    )
     snapshot = None
     for event in EVERY_DELTA:
-        snapshot = streaming.accumulate_event(event=event, current_snapshot=snapshot)
+        snapshot = accumulate(event=event, current_snapshot=snapshot, **buffers)
     assert snapshot is not None
 
     folded = fold_anthropic_stream(_sse(*EVERY_DELTA))
