@@ -43,6 +43,12 @@ injection, tokenization, and compression. Native upstreams receive the original
 decoded JSON bytes; obsolete compression headers are removed. Streaming and
 non-streaming responses retain their normal protocol.
 
+Required auth-specific wire settings still apply: ChatGPT Responses receives
+`store: false` even when the client omitted it or set it to true. This
+reserializes the body only when that setting needs rewriting; an already-valid
+body remains byte-faithful. Vertex route-forced streaming is retained even
+without a `stream` body field.
+
 Envelope/model routing currently requires one JSON parse. Configured or
 per-request translating backends still perform the necessary wire conversion,
 but do not run request-side compression. Passthrough outcomes report zero

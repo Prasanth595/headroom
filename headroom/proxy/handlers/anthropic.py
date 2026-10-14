@@ -1274,6 +1274,7 @@ class AnthropicHandlerMixin:
                         request_id,
                         start_time,
                         tags,
+                        force_stream=force_stream,
                     )
                 passthrough_base = upstream_base_url or self.ANTHROPIC_API_URL
                 passthrough_url = build_anthropic_upstream_url(

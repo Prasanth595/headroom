@@ -69,33 +69,80 @@ def test_startup_override_changes_http_admission_after_restart() -> None:
 
 
 @pytest.fixture
-def admitted_proxy(monkeypatch):
+def admitted_proxy(monkeypatch, request):
     from fastapi.testclient import TestClient
 
     from headroom.proxy import request_limit_policy
     from headroom.proxy.server import ProxyConfig, create_app
 
     monkeypatch.setattr(request_limit_policy, "COMPRESSION_BODY_MAX_BYTES", 1024)
+    backend = getattr(request, "param", "anthropic")
+    sdk = pytest.importorskip("litellm") if backend != "anthropic" else None
 
     class Provider(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
 
         def do_POST(self):
-            self.rfile.read(int(self.headers["content-length"]))
-            response = json.dumps(
-                {
-                    "id": "msg_admission",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "claude-sonnet-4-6",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
-                    "usage": {"input_tokens": 101, "output_tokens": 1},
+            body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            path = self.path.split("?", 1)[0]
+            if path.endswith("/responses"):
+                if "input" not in body or body.get("store") is not False:
+                    self.send_error(400, "Unsupported Responses wire request")
+                    return
+                response = json.dumps(
+                    {
+                        "id": "resp_admission",
+                        "object": "response",
+                        "output": [],
+                        "usage": {"input_tokens": 101, "output_tokens": 1},
+                    }
+                ).encode()
+                content_type = "application/json"
+            elif path.endswith("/chat/completions"):
+                payload = {
+                    "id": "chat_admission",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-4o",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 101, "completion_tokens": 1, "total_tokens": 102},
                 }
-            ).encode()
+                if body.get("stream", False):
+                    payload["object"] = "chat.completion.chunk"
+                    payload["choices"] = [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                    response = ("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n").encode()
+                    content_type = "text/event-stream"
+                else:
+                    response = json.dumps(payload).encode()
+                    content_type = "application/json"
+            else:
+                response = json.dumps(
+                    {
+                        "id": "msg_admission",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-6",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 101, "output_tokens": 1},
+                    }
+                ).encode()
+                content_type = "application/json"
             self.send_response(200)
-            self.send_header("content-type", "application/json")
+            self.send_header("content-type", content_type)
             self.send_header("content-length", str(len(response)))
             self.end_headers()
             self.wfile.write(response)
@@ -103,11 +150,17 @@ def admitted_proxy(monkeypatch):
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
+    if sdk is not None:
+        monkeypatch.setattr(sdk, "api_base", f"http://127.0.0.1:{provider.server_port}/v1")
+        monkeypatch.setattr(sdk, "api_key", "synthetic-only")
+        monkeypatch.setenv("OPENAI_API_KEY", "synthetic-only")
     config = ProxyConfig(
         anthropic_api_url=f"http://127.0.0.1:{provider.server_port}",
         openai_api_url=f"http://127.0.0.1:{provider.server_port}",
         gemini_api_url=f"http://127.0.0.1:{provider.server_port}",
         bedrock_api_url=f"http://127.0.0.1:{provider.server_port}",
+        vertex_api_url=f"http://127.0.0.1:{provider.server_port}",
+        backend=backend,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
@@ -198,3 +251,57 @@ def test_soft_passthrough_still_obeys_decompressed_hard_ceiling(admitted_proxy, 
     )
     assert response.status_code == 413
     assert admitted_proxy.get("/livez").status_code == 200
+
+
+def test_large_copilot_chat_remains_a_chat_completions_request(admitted_proxy, monkeypatch):
+    base = admitted_proxy.app.state.proxy.config.openai_api_url
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", base)
+    response = admitted_proxy.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "history " * 3000}],
+        },
+        headers={"authorization": "Bearer tid_synthetic_client"},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+
+
+def test_large_codex_request_receives_the_required_store_setting(admitted_proxy, monkeypatch):
+    from headroom.providers.codex import endpoints
+
+    monkeypatch.setattr(
+        endpoints,
+        "CHATGPT_BACKEND_API_URL",
+        admitted_proxy.app.state.proxy.config.openai_api_url,
+    )
+    response = admitted_proxy.post(
+        "/v1/responses",
+        json={"model": "gpt-5-codex", "input": "history " * 3000},
+        headers={
+            "authorization": "Bearer synthetic_subscription",
+            "chatgpt-account-id": "synthetic_account",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["object"] == "response"
+
+
+@pytest.mark.parametrize("admitted_proxy", ["litellm-openai"], indirect=True)
+def test_large_vertex_backend_retains_route_forced_streaming(admitted_proxy):
+    response = admitted_proxy.post(
+        "/v1/projects/synthetic/locations/us-central1/publishers/anthropic/models/gpt-4o:streamRawPredict",
+        json={
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "history " * 3000}],
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert events[-1]["type"] == "message_stop"

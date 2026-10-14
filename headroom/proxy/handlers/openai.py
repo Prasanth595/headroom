@@ -489,6 +489,17 @@ def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
     return _OPENAI_CHAT_COMPLETIONS_PATH
 
 
+def _resolve_openai_chat_forward_path(
+    request_headers: dict[str, str], custom_upstream_base_url: str | None
+) -> str:
+    """Keep Chat Completions bodies on their effective Chat wire destination."""
+    if custom_upstream_base_url is not None:
+        return _resolve_openai_handler_path(
+            request_headers, handler_path=_OPENAI_CHAT_COMPLETIONS_PATH
+        )
+    return "/v1/chat/completions"
+
+
 def _append_request_query(url: str, query: str) -> str:
     if not query:
         return url
@@ -3279,6 +3290,9 @@ class OpenAIHandlerMixin:
                     start_time,
                     tags,
                 )
+            handler_path = _resolve_openai_chat_forward_path(
+                request.headers, custom_upstream_base_url
+            )
             url = _append_request_query(
                 build_copilot_upstream_url(upstream_base_url, handler_path),
                 request.url.query,
@@ -3396,14 +3410,7 @@ class OpenAIHandlerMixin:
         # the funnel uses for passthrough_reason + memory_skip_reason.
         _image_decision.apply_to_tags(tags)
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        handler_path = (
-            _resolve_openai_handler_path(
-                request.headers,
-                handler_path=_OPENAI_CHAT_COMPLETIONS_PATH,
-            )
-            if custom_upstream_base_url is not None
-            else "/v1/chat/completions"
-        )
+        handler_path = _resolve_openai_chat_forward_path(request.headers, custom_upstream_base_url)
         openai_chat_outcome_provider = _openai_outcome_provider(
             request.method, handler_path, custom_upstream_base_url, upstream_base_url
         )
@@ -5742,9 +5749,14 @@ class OpenAIHandlerMixin:
             )
             url = _append_request_query(url, request.url.query)
         if len(original_body_bytes) > COMPRESSION_BODY_MAX_BYTES:
+            outbound_body_bytes = original_body_bytes
+            if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
+                outbound_body_bytes = json.dumps(
+                    body, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8")
             assert self.http_client is not None, "http_client must be initialized"
             upstream_request = self.http_client.build_request(
-                request.method, url, headers=headers, content=original_body_bytes
+                request.method, url, headers=headers, content=outbound_body_bytes
             )
             logger.info(
                 "[%s] event=compression_passthrough reason=request_body_soft_limit "
@@ -11134,12 +11146,14 @@ class OpenAIHandlerMixin:
         request_id: str,
         start_time: float,
         tags: dict[str, str],
+        *,
+        force_stream: bool = False,
     ) -> Response:
         """Retain configured backend translation without request-side transforms."""
         from fastapi.responses import JSONResponse
 
         tags["passthrough_reason"] = "request_body_soft_limit"
-        if body.get("stream", False):
+        if body.get("stream", False) or force_stream:
             # No local tokenization ran. Zero is the existing "unmeasured"
             # convention; these finalizers separately record actual provider usage.
             if wire_provider == "openai":
