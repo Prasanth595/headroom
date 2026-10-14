@@ -199,6 +199,10 @@ proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
+# Mach thread APIs for the per-thread CPU check in tests/magika_idle_threads.rs.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
+
 [[bench]]
 name = "tokenizer"
 harness = false

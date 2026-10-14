@@ -1958,6 +1958,7 @@ dependencies = [
  "hf-hub",
  "http 1.5.0",
  "icu_segmenter",
+ "libc",
  "magika",
  "md-5",
  "ort",
