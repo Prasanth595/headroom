@@ -2838,14 +2838,14 @@ def apply_session_sticky_ccr_tool(
     Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
     fresh list (caller-safe).
     """
-    from headroom.ccr.tool_injection import _client_retrieval_tool_name
+    from headroom.ccr.tool_calls import client_retrieval_tool_name
 
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
     # Only default Headroom aliases claim ownership, not arbitrary MCP servers.
-    if _client_retrieval_tool_name(tools_out):
+    if client_retrieval_tool_name(tools_out):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,

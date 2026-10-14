@@ -21,27 +21,6 @@ from typing import Any, Protocol, runtime_checkable
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
-_CLIENT_CCR_TOOL_ALIASES = frozenset(
-    {
-        "headroom_headroom_retrieve",
-        "mcp__headroom__headroom_retrieve",
-        "mcp_headroom_headroom_retrieve",
-    }
-)
-
-
-def _client_retrieval_tool_name(tools: list[dict[str, Any]] | None) -> str | None:
-    """Select a canonical tool or a default Headroom server's client alias."""
-    alias = None
-    for tool in tools or ():
-        function = tool.get("function")
-        name = function.get("name") if isinstance(function, dict) else tool.get("name")
-        if name == CCR_TOOL_NAME:
-            return name
-        if alias is None and isinstance(name, str) and name.lower() in _CLIENT_CCR_TOOL_ALIASES:
-            alias = name
-    return alias
-
 
 @runtime_checkable
 class _HashOwnershipStore(Protocol):
@@ -480,7 +459,9 @@ class CCRToolInjector:
 
         tools = tools or []
 
-        if _client_retrieval_tool_name(tools):
+        from .tool_calls import client_retrieval_tool_name
+
+        if client_retrieval_tool_name(tools):
             return tools, False  # Already present, skip injection
 
         # Add CCR tool
@@ -504,10 +485,12 @@ class CCRToolInjector:
         if not self.inject_system_instructions or not self.has_compressed_content:
             return messages
 
+        from .tool_calls import client_retrieval_tool_name
+
         instructions = create_system_instructions(
             self._detected_hashes,
             self.retrieval_endpoint,
-            retrieval_tool_name=_client_retrieval_tool_name(tools) or CCR_TOOL_NAME,
+            retrieval_tool_name=client_retrieval_tool_name(tools) or CCR_TOOL_NAME,
         )
 
         # Find and update system message

@@ -84,13 +84,9 @@ When the LLM calls `headroom_retrieve`:
 3. The result is added to the conversation
 4. The API call continues automatically
 
-On the Anthropic and OpenAI proxy paths, proxy-owned retrieval-only responses
-are resolved server-side. Mixed responses that also call client-owned tools
-are forwarded for the client to execute; MCP-registered retrieval aliases
-remain client-owned.
-
-Alias-only retrieval responses are also forwarded to the client: the proxy
-intercepts only its bare `headroom_retrieve` tool, not MCP-registered aliases.
+On the Anthropic and OpenAI proxy paths, only retrieval-only responses naming
+the proxy's bare `headroom_retrieve` are resolved server-side. Mixed responses
+and all MCP-registered retrieval aliases are forwarded for the client to execute.
 
 <Callout type="warning" title="Gemini CCR boundary">
   Buffered native Gemini requests resolve `headroom_retrieve` server-side and

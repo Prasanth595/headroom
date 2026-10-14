@@ -105,6 +105,15 @@ def test_the_tool_is_present_from_the_very_first_request(provider):
     assert CCR_TOOL_NAME in _names(tools)
 
 
+def test_the_tool_definition_is_small_enough_that_eager_is_obviously_right():
+    """Bound the cold-prefix overhead that justifies eager injection."""
+    size = len(json.dumps(create_ccr_tool_definition()))
+    assert size < 2000, (
+        f"headroom_retrieve is now {size} bytes; eager injection was justified "
+        "on it being ~478 bytes (~119 tokens) of the session's first cache write"
+    )
+
+
 # ── the escape hatch still works ──────────────────────────────────────
 
 
@@ -125,7 +134,7 @@ def test_an_invalid_mode_raises_rather_than_silently_defaulting(monkeypatch):
     from headroom.proxy.helpers import get_ccr_tool_injection_mode
 
     monkeypatch.setenv("HEADROOM_CCR_TOOL_INJECTION", "sometimes")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="HEADROOM_CCR_TOOL_INJECTION"):
         get_ccr_tool_injection_mode()
 
 
