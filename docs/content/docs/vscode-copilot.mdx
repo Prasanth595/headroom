@@ -128,6 +128,10 @@ A configured base path is removed only for the same scheme and authority, at a
 complete path-segment boundary. Other recognized completions endpoints keep
 their native `/v1` paths.
 
+The inline auth branch logs only the credential kind (`ghu_***`), not the
+editor's OAuth token. Case variants of unrelated provider API-key headers are
+removed before any Copilot auth branch forwards the request.
+
 ## Stop and undo
 
 Press `Ctrl+C` to stop the session proxy. The VS Code endpoint setting remains so
