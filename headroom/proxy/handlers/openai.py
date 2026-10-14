@@ -1110,8 +1110,9 @@ def _drop_undeclared_web_search_calls(
     Mutates *payload* in place and returns the number of items dropped
     (0 = untouched). Callers skip it for a bypass request
     (``x-headroom-bypass: true``), which asked for its bytes untouched.
-    Disable with ``HEADROOM_WEB_SEARCH_HISTORY=0``. Remove once the backend
-    accepts such a body.
+    Disable with ``HEADROOM_WEB_SEARCH_HISTORY=0`` (a registered runtime-env
+    knob, so ``headroom wrap`` also pushes it to a reused proxy). Remove once
+    the backend accepts such a body.
     """
     items = payload.get("input")
     if not isinstance(items, list) or payload.get("previous_response_id"):
