@@ -29,10 +29,30 @@ From a field log (Copilot Chat on Windows, 0.36.x), on every single request:
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import tiktoken
 
+from headroom.transforms.kompress_compressor import KompressCompressor
 from headroom.transforms.kompress_remote import RemoteKompressCompressor
+
+
+def _kwargs(fn) -> set[str]:
+    """Keywords promised by the public drop-in API, excluding internal budgets."""
+    return {
+        name
+        for name, parameter in inspect.signature(fn).parameters.items()
+        if name != "self"
+        and not name.startswith("_")
+        and parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
+    }
+
+
+def test_remote_compress_accepts_every_local_keyword() -> None:
+    """A missing public keyword silently disables compression at the shared seam."""
+    missing = _kwargs(KompressCompressor.compress) - _kwargs(RemoteKompressCompressor.compress)
+    assert not missing, f"Remote Kompress rejects public local keywords: {sorted(missing)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -102,7 +122,15 @@ def test_remote_ccr_recovers_original_not_protection_placeholders(
         payload={"compressed": "short", "compression_ratio": 0.2, "original_tokens": 999},
     )
     source = PLACEHOLDER if with_override else ORIGINAL
-    result = c.compress(source, ccr_original=ORIGINAL if with_override else None)
+    result = c.compress(
+        source,
+        context="Preserve the full original for client retrieval.",
+        content_type="text",
+        question="What did the protected block contain?",
+        target_ratio=0.2,
+        allow_download=False,
+        ccr_original=ORIGINAL if with_override else None,
+    )
 
     assert result.cache_key is not None
     recovered = ccr_store.retrieve(result.cache_key)

@@ -35,7 +35,7 @@ def test_compress_batch_validates_ccr_originals_length():
     import pytest
 
     kc = KompressCompressor.__new__(KompressCompressor)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="ccr_originals"):
         kc.compress_batch(
             ["one input"],
             ccr_originals=["a", "b"],  # length 2 != 1 input
@@ -93,6 +93,31 @@ def _isolated_store_and_model(monkeypatch):
         {KompressConfig().model_id: model},
     )
     return store
+
+
+def test_router_omits_ccr_original_when_no_tags(monkeypatch):
+    """A legacy compressor without the tag keyword must still compress plain text."""
+    _isolated_store_and_model(monkeypatch)
+
+    class LegacyKompress(KompressCompressor):
+        def compress(
+            self, content, *, context="", question=None, target_ratio=None, allow_download=True
+        ):
+            return super().compress(
+                content,
+                context=context,
+                question=question,
+                target_ratio=target_ratio,
+                allow_download=allow_download,
+            )
+
+    compressor = LegacyKompress(KompressConfig(min_input_words=10, enable_ccr=False))
+    router = _kompress_router()
+    monkeypatch.setattr(router, "_get_kompress", lambda: compressor)
+    original = " ".join(["plain"] * 100)
+    compressed, tokens = router._try_ml_compressor(original, context="")
+    assert compressed == "plain plain"
+    assert tokens > 0
 
 
 def test_inline_ccr_retrieval_recovers_protected_original(monkeypatch):
