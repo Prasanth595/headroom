@@ -154,6 +154,18 @@ def test_resolver_tier4_env_block_bulleted_cwd_format() -> None:
     assert display == "bulleted-cwd"
 
 
+def test_extract_cwd_prefers_primary_working_directory_over_earlier_cwd() -> None:
+    prompt = "cwd: /work/old\nPrimary working directory: /work/current\n"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(prompt) == "/work/current"
+
+
+def test_extract_cwd_preserves_vertical_tab_inside_path() -> None:
+    cwd = "/work/a\vpart"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(f"cwd: {cwd}\n") == cwd
+
+
 def test_resolver_ignores_incidental_cwd_prose() -> None:
     r = ProjectResolver()
     assert (

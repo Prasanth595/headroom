@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Known prefixes that mark a working-directory line inside a client's
 # ``<env>`` / ``<environment>`` system-prompt block. Ordered so that the
 # most specific / most recent client format is tried first. Matched with
-# literal ``str.find`` — no regex.
+# literal line-start checks after trimming — no regex.
 _CWD_PREFIXES: tuple[str, ...] = (
     "Primary working directory:",  # Claude Code (current)
     "Working directory:",  # Claude Code (older) / Codex
@@ -210,11 +210,11 @@ class ProjectResolver:
     def _extract_cwd_from_system_prompt(cls, system_prompt: str) -> str | None:
         if not system_prompt:
             return None
-        for raw_line in system_prompt.splitlines():
-            line = raw_line.strip()
-            if line.startswith("-"):
-                line = line[1:].lstrip()
-            for prefix in _CWD_PREFIXES:
+        for prefix in _CWD_PREFIXES:
+            for raw_line in system_prompt.split("\n"):
+                line = raw_line.strip()
+                if line.startswith("-"):
+                    line = line[1:].lstrip()
                 if not line.startswith(prefix):
                     continue
                 chunk = line[len(prefix) :].strip()
