@@ -7,15 +7,16 @@ the turn after a load started a new lineage at frozen=0, the pipeline re-ran
 the whole history, and history it had forwarded verbatim came out compressed:
 different bytes, so the provider re-wrote the message tier.
 
-The upstream below models Anthropic's prompt cache with deferred tools left
-out of the key, so the assertions are on what the provider would do with the
-bytes the handler forwards.
+The upstream below models Anthropic's prompt cache over the bytes the handler
+forwards, deferred tools left out of the key, so the assertions are on what
+the provider would do with them.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -26,14 +27,30 @@ import httpx
 from fastapi.testclient import TestClient
 
 from headroom.cache.prefix_tracker import PrefixCacheTracker, cache_key_tools
+from headroom.proxy.helpers import reset_deferred_orphan_warn_state
 from headroom.proxy.server import ProxyConfig, create_app
 
 MODEL = "claude-sonnet-4-5-20250929"
 SYSTEM = [{"type": "text", "text": "You are a coding agent. " * 40}]
-TOOL = {"name": "Read", "input_schema": {"type": "object"}}
-DEFERRED = {"name": "mcp__docs__search", "input_schema": {"type": "object"}, "defer_loading": True}
-EAGER = {"name": "WebFetch", "input_schema": {"type": "object"}}
 MARKER = {"type": "ephemeral"}
+READ = {"name": "Read", "input_schema": {"type": "object"}}
+# What Claude Code (2.1.296) sends while it defers tools: its client-side
+# ToolSearch tool, a reserved placeholder that is deferred on every request,
+# and each tool ToolSearch has loaded, still deferred.
+TOOL_SEARCH = {
+    "name": "ToolSearch",
+    "description": "Search for tools by name or description.",
+    "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+}
+PLACEHOLDER = {
+    "name": "DeferredToolPlaceholder",
+    "description": "Reserved placeholder that keeps deferred tool loading active; never call this tool.",
+    "input_schema": {"type": "object"},
+    "defer_loading": True,
+}
+TOOLS = [READ, TOOL_SEARCH, PLACEHOLDER]
+LOADED = {"name": "mcp__docs__search", "input_schema": {"type": "object"}, "defer_loading": True}
+EAGER = {"name": "WebFetch", "input_schema": {"type": "object"}}
 
 
 def _strip(obj: Any) -> Any:
@@ -74,6 +91,38 @@ def _history(turns: int) -> list[dict[str, Any]]:
             },
         ]
     messages[-1]["content"][-1]["cache_control"] = dict(MARKER)
+    return messages
+
+
+def _after_tool_search(turns: int) -> list[dict[str, Any]]:
+    """The request carrying ToolSearch's result: the loaded tool comes back as
+    a tool_reference, and Claude Code appends it to ``tools``."""
+    messages = _history(turns)
+    del messages[-1]["content"][-1]["cache_control"]
+    messages += [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_ts",
+                    "name": "ToolSearch",
+                    "input": {"query": "docs"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_ts",
+                    "content": [{"type": "tool_reference", "tool_name": LOADED["name"]}],
+                    "cache_control": dict(MARKER),
+                }
+            ],
+        },
+    ]
     return messages
 
 
@@ -126,28 +175,31 @@ def _drive(requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]) ->
 
         store.resolve_tracker = _resolve
 
-        async def _upstream(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN003
+        def _reply(body: dict[str, Any]) -> dict[str, Any]:
             read, write = cache.request(body)
-            seen[-1]["forwarded"] = copy.deepcopy(body["messages"])
-            seen[-1]["read"] = read
-            seen[-1]["write"] = write
-            return httpx.Response(
-                200,
-                json={
-                    "id": "msg_x",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": MODEL,
-                    "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
-                    "usage": {
-                        "input_tokens": 10,
-                        "output_tokens": 2,
-                        "cache_read_input_tokens": read,
-                        "cache_creation_input_tokens": write,
-                    },
-                },
+            seen[-1].update(
+                forwarded=copy.deepcopy(body["messages"]),
+                tools=copy.deepcopy(body.get("tools")),
+                read=read,
+                write=write,
             )
+            return {
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "model": MODEL,
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": read,
+                    "cache_creation_input_tokens": write,
+                },
+            }
+
+        async def _upstream(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN003
+            return httpx.Response(200, json=_reply(body))
 
         proxy._retry_request = _upstream
         for tools, messages in requests:
@@ -168,8 +220,11 @@ def _drive(requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]) ->
 
 
 def _session(added: dict[str, Any]) -> tuple[dict, dict]:
-    turns = [([TOOL], _history(n)) for n in range(1, 10)]
-    turns.append(([TOOL, added], _history(10)))
+    turns = [(TOOLS, _history(n)) for n in range(1, 10)]
+    if added is LOADED:
+        turns.append(([*TOOLS, added], _after_tool_search(9)))
+    else:
+        turns.append(([*TOOLS, added], _history(10)))
     seen = _drive(turns)
     return seen[-2], seen[-1]
 
@@ -182,21 +237,32 @@ def _isolated_state(monkeypatch, tmp_path):  # noqa: ANN001, ANN202
     # Each proxied request appends to the savings ledger, by default the
     # developer's real ~/.headroom/savings_events.jsonl.
     monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(tmp_path / "savings_events.jsonl"))
+    # Headroom does not recognize Claude Code's client-side ToolSearch as a
+    # search tool by default, so a request with deferred tools logs
+    # tool_search_deferred_orphan. Naming it is the documented remedy and
+    # changes nothing on the lineage path.
+    monkeypatch.setenv("HEADROOM_CLIENT_TOOL_SEARCH_NAMES", "ToolSearch")
+    reset_deferred_orphan_warn_state()
     reset_compression_store()
 
 
-def test_deferred_tool_load_keeps_the_lineage_and_its_cached_prefix() -> None:
-    before, after = _session(DEFERRED)
+def test_deferred_tool_load_keeps_the_lineage_and_its_cached_prefix(caplog) -> None:  # noqa: ANN001
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        before, after = _session(LOADED)
 
     assert after["tracker"] is before["tracker"]
     assert after["frozen"] == len(before["forwarded"])
     assert _strip(after["forwarded"][: len(before["forwarded"])]) == _strip(before["forwarded"])
     assert after["read"] == before["read"] + before["write"]
+    # Forwarded as Claude Code sent it: still deferred, reference intact.
+    assert after["tools"][-1] == LOADED
+    assert after["forwarded"][-1]["content"][0]["content"][0]["tool_name"] == LOADED["name"]
+    assert not [r for r in caplog.records if "tool_search_deferred_orphan" in r.getMessage()]
 
 
 def test_kill_switch_keys_deferred_tools_again(monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.setenv("HEADROOM_DEFERRED_TOOL_AFFINITY", "0")
-    before, after = _session(DEFERRED)
+    before, after = _session(LOADED)
 
     assert after["tracker"] is not before["tracker"]
     assert after["frozen"] == 0
@@ -213,11 +279,11 @@ def test_eager_tool_still_starts_a_new_lineage() -> None:
 
 
 def test_cache_key_tools_drops_only_deferred_tools(monkeypatch) -> None:  # noqa: ANN001
-    undeferred = {**DEFERRED, "defer_loading": False}
-    tools = [TOOL, DEFERRED, undeferred]
+    undeferred = {**LOADED, "defer_loading": False}
+    tools = [READ, LOADED, undeferred]
 
-    assert cache_key_tools(tools) == [TOOL, undeferred]
-    assert tools == [TOOL, DEFERRED, undeferred]
+    assert cache_key_tools(tools) == [READ, undeferred]
+    assert tools == [READ, LOADED, undeferred]
     assert cache_key_tools(None) is None
     monkeypatch.setenv("HEADROOM_DEFERRED_TOOL_AFFINITY", "off")
     assert cache_key_tools(tools) is tools
