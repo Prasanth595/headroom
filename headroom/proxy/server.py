@@ -163,6 +163,7 @@ from headroom.proxy.modes import (
     PROXY_MODE_TOKEN,
     is_token_mode,
     normalize_proxy_mode,
+    read_maturation_inert_reason,
 )
 from headroom.proxy.orphan_watchdog import (
     orphan_grace_seconds,
@@ -2092,6 +2093,25 @@ class HeadroomProxy(
         if self.config.mode == PROXY_MODE_CACHE:
             logger.info("  Prefix freeze: strict (all prior turns immutable)")
             logger.info("  Mutations: latest turn only")
+        if self.config.read_maturation:
+            _inert = read_maturation_inert_reason(
+                self.config.mode,
+                quiesce_turns=self.config.read_maturation_quiesce_turns,
+                max_hold_turns=self.config.read_maturation_max_hold_turns,
+            )
+            if _inert:
+                logger.warning(
+                    "Read maturation: INERT (%s); use --mode token or disable read_maturation",
+                    _inert,
+                )
+            else:
+                logger.info(
+                    "Read maturation: ENABLED (quiesce_turns=%d max_hold_turns=%d "
+                    "min_size_bytes=%d)",
+                    self.config.read_maturation_quiesce_turns,
+                    self.config.read_maturation_max_hold_turns,
+                    self.config.read_maturation_min_size_bytes,
+                )
         # Effective compression posture, resolved (not merely requested). The
         # savings profile reaches the router through two paths — the config
         # object and the seeded process env — and `setdefault` semantics mean a
@@ -5374,6 +5394,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # Effective state from the running process. This is the supported
             # black-box provenance surface for benchmark/qualification tools.
             "rollout": proxy.config.rollout.to_dict() if proxy.config.rollout else None,
+            "read_maturation": _read_maturation_status(proxy.config),
+        }
+
+    def _read_maturation_status(cfg: ProxyConfig) -> dict[str, Any]:
+        # The rollout snapshot says whether the feature is enabled, not whether
+        # it can act; cache mode leaves it enabled but unable to fire.
+        inert = (
+            read_maturation_inert_reason(
+                cfg.mode,
+                quiesce_turns=cfg.read_maturation_quiesce_turns,
+                max_hold_turns=cfg.read_maturation_max_hold_turns,
+            )
+            if cfg.read_maturation
+            else None
+        )
+        return {
+            "enabled": cfg.read_maturation,
+            "effective": cfg.read_maturation and inert is None,
+            "inert_reason": inert,
         }
 
     def _dashboard_config_payload() -> dict[str, Any]:
