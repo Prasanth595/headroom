@@ -49,8 +49,17 @@ object-key sampling could safely return.
 When recursive processing leaves a valid JSON value unchanged, SmartCrusher
 returns its original bytes and sets `was_modified=False`. This applies to
 objects, arrays, and scalars, including whitespace, Unicode escapes, and numeric
-representations. Whitespace-only minification is not advertised as compression.
-Actual transformations still use compact JSON serialization.
+representations. Actual structural transformations still use compact JSON
+serialization.
+
+The routing pipeline then applies the existing Rust `JsonMinifier` as a separate
+lossless step when SmartCrusher leaves routed JSON unchanged. Savings are
+attributed to `json_minifier`, not `smart_crusher`, and do not create structural
+TOIN records. Minification removes only whitespace outside strings: key order,
+duplicate keys, string escapes, and number spellings remain byte-stable. Repeating
+the same input produces the same output; already-minified JSON is a no-op.
+The native live-zone JSON-array arm follows the same explicit step; its existing
+content-type and token-reduction gates still apply.
 
 ### Comparing historical TOIN data
 
@@ -106,6 +115,22 @@ print(result.strategy)  # e.g. "lossless:table(...)" or "smart_sample(1000->15)"
 ```
 </Tab>
 </Tabs>
+
+### Recovered tool output in the Python message transform
+
+`SmartCrusher.apply(messages, tokenizer)` preserves recognized
+`headroom_retrieve` results byte for byte when their call ID matches the
+originating assistant call. The originating identity is resolved with the
+shared wrapper parser for both OpenAI `tool_calls`/`arguments` and Anthropic
+`tool_use`/`input`, including Hermes `tool_call` bridges and retrieval calls
+inside `execute`, `exec`, or `functions.exec`.
+
+Other wrapper output remains compressible; an unrecognized or ambiguous
+wrapper does not gain a blanket recovery exemption. Keep the originating
+assistant call in the message history so the result can be identified.
+The context-free `crush(json_string)` API has no originating-call history and
+does not provide this message-level exemption.
+
 
 ## Configuration
 

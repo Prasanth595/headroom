@@ -115,6 +115,7 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 #[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
+use super::pipeline::JsonMinifier;
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
@@ -1659,6 +1660,12 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             // arrays, and returns the input.
             let result = smart_crusher().crush(text, EMPTY_QUERY, DEFAULT_BIAS);
             if !result.was_modified {
+                if let Ok(Some(minified)) = JsonMinifier.minify(text) {
+                    return DispatchResult::Compressed {
+                        strategy: "json_minifier",
+                        compressed: minified,
+                    };
+                }
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
                 };

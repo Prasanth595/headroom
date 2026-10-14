@@ -437,7 +437,7 @@ class TestCompressEndpointLossyInlineMode:
     NO CCR marker / retrieval round-trip, so the output is safe to forward
     straight to a provider (Kong-sidecar use case)."""
 
-    def _big_tool_message(self, repetitions=20):
+    def _big_tool_message(self, repetitions=1):
         large_data = json.dumps(
             [
                 {
@@ -460,9 +460,7 @@ class TestCompressEndpointLossyInlineMode:
 
     @pytest.fixture
     def client(self):
-        # disable_kompress keeps the real ONNX model out of the test: marker
-        # suppression is exercised by SmartCrusher (pure-Python) regardless, and
-        # the mode inherits enable_kompress from config so this stays fast.
+        # Exercise the actual native JSON steps without unrelated ML inference.
         config = ProxyConfig(
             optimize=True,
             cache_enabled=False,
@@ -474,8 +472,11 @@ class TestCompressEndpointLossyInlineMode:
         with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
             yield c
 
-    def test_lossy_inline_emits_no_ccr_markers(self, client):
-        messages = self._big_tool_message()
+    @pytest.mark.parametrize(
+        ("repetitions", "strategy"), [(1, "json_minifier"), (20, "smart_crusher")]
+    )
+    def test_lossy_inline_emits_no_ccr_markers(self, client, repetitions, strategy):
+        messages = self._big_tool_message(repetitions=repetitions)
         response = client.post(
             "/v1/compress",
             json={"messages": messages, "model": "gpt-4", "config": {"mode": "lossy_inline"}},
@@ -501,13 +502,20 @@ class TestCompressEndpointLossyInlineMode:
         original_rows = json.loads(messages[1]["content"])
         tool = next(message for message in data["messages"] if message["role"] == "tool")
         compressed_rows, _ = json.JSONDecoder().raw_decode(tool["content"])
-        assert len(compressed_rows) < len(original_rows)
-        assert {json.dumps(row, sort_keys=True) for row in compressed_rows} == {
-            json.dumps(row, sort_keys=True) for row in original_rows
-        }
+        if repetitions == 1:
+            assert compressed_rows == original_rows
+        else:
+            assert len(compressed_rows) < len(original_rows)
+            assert {json.dumps(row, sort_keys=True) for row in compressed_rows} == {
+                json.dumps(row, sort_keys=True) for row in original_rows
+            }
+        assert strategy in {transform.split(":")[1] for transform in data["transforms_applied"]}
 
     def test_lossy_inline_preserves_no_op_tool_content(self, client):
-        messages = self._big_tool_message(repetitions=1)
+        messages = self._big_tool_message()
+        messages[1]["content"] = json.dumps(
+            json.loads(messages[1]["content"]), separators=(",", ":")
+        )
         original = messages[1]["content"]
         response = client.post(
             "/v1/compress",

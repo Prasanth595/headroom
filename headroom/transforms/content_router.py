@@ -1697,6 +1697,7 @@ class CompressionStrategy(Enum):
 
     CODE_AWARE = "code_aware"
     SMART_CRUSHER = "smart_crusher"
+    JSON_MINIFIER = "json_minifier"
     SEARCH = "search"
     LOG = "log"
     KOMPRESS = "kompress"
@@ -2489,7 +2490,6 @@ class ContentRouter(Transform):
         # skip — i.e. revert it to original text and bust the provider prefix
         # cache. Counting pins isolates the freeze's attributable payoff.
         self._freeze_pin_hits = 0
-        self._freeze_pin_chars = 0
 
     # ── #3486: per-request runtime state accessors ──────────────────────
     #
@@ -2624,7 +2624,6 @@ class ContentRouter(Transform):
         preserved = max(0, int(len(content) * (1.0 - cached_ratio)))
         with self._frozen_lock:
             self._freeze_pin_hits += 1
-            self._freeze_pin_chars += preserved
             hits = self._freeze_pin_hits
         logger.info(
             f"FREEZE-PIN: pins={hits} cached_ratio={cached_ratio:.3f} "
@@ -2769,8 +2768,8 @@ class ContentRouter(Transform):
             language: Optional language hint for code.
             context: Query context for pattern learning.
         """
-        # Skip SmartCrusher - it handles its own TOIN recording
-        if strategy == CompressionStrategy.SMART_CRUSHER:
+        # SmartCrusher records its own decisions; reformatting does not train TOIN.
+        if strategy in {CompressionStrategy.SMART_CRUSHER, CompressionStrategy.JSON_MINIFIER}:
             return
 
         # Skip if no actual compression happened
@@ -3225,6 +3224,8 @@ class ContentRouter(Transform):
                 question,
                 bias=bias,
             )
+            if _section_chain == [CompressionStrategy.JSON_MINIFIER.value]:
+                strategy = CompressionStrategy.JSON_MINIFIER
 
             # Preserve code fence markers
             if section.is_code_fence and section.language:
@@ -3262,11 +3263,20 @@ class ContentRouter(Transform):
         compressed = "\n\n".join(compressed_sections)
         if protected:
             compressed = restore_tags(compressed, protected)
+        applied_strategies = {
+            decision.strategy
+            for decision in routing_log
+            if decision.compressed_tokens < decision.original_tokens
+        }
 
         return RouterCompressionResult(
             compressed=compressed,
             original=content,
-            strategy_used=CompressionStrategy.MIXED,
+            strategy_used=(
+                next(iter(applied_strategies))
+                if len(applied_strategies) == 1
+                else CompressionStrategy.MIXED
+            ),
             routing_log=routing_log,
             sections_processed=len(sections),
         )
@@ -3296,6 +3306,8 @@ class ContentRouter(Transform):
         compressed, compressed_tokens, strategy_chain = self._apply_strategy_to_content(
             content, strategy, context, question=question, bias=bias
         )
+        if strategy_chain == [CompressionStrategy.JSON_MINIFIER.value]:
+            strategy = CompressionStrategy.JSON_MINIFIER
 
         return RouterCompressionResult(
             compressed=compressed,
@@ -4077,6 +4089,18 @@ class ContentRouter(Transform):
                             compressed = output.content
                             compressed_tokens = _estimate_tokens(output.content)
                             decision_reason = "smart_crusher"
+                            if compressed == content:
+                                from headroom._core import minify_json
+
+                                minified = minify_json(content)
+                                if minified is not None:
+                                    compressed = minified
+                                    compressed_tokens = _estimate_tokens(minified)
+                                    strategy = CompressionStrategy.JSON_MINIFIER
+                                    actual_strategy = strategy
+                                    strategy_chain = [strategy.value]
+                                    compressor_name = "JsonMinifier"
+                                    decision_reason = "json_minifier"
                         # Fallback to Kompress (and possibly Log) is
                         # handled by the unified post-strategy block below
                         # — no inline fallback here to avoid duplicate
@@ -4848,6 +4872,7 @@ class ContentRouter(Transform):
         mapping = {
             CompressionStrategy.CODE_AWARE: ContentType.SOURCE_CODE,
             CompressionStrategy.SMART_CRUSHER: ContentType.JSON_ARRAY,
+            CompressionStrategy.JSON_MINIFIER: ContentType.JSON_ARRAY,
             CompressionStrategy.SEARCH: ContentType.SEARCH_RESULTS,
             CompressionStrategy.LOG: ContentType.BUILD_OUTPUT,
             CompressionStrategy.DIFF: ContentType.GIT_DIFF,
@@ -7885,24 +7910,3 @@ class ContentRouter(Transform):
         Always returns True - the router handles all content types.
         """
         return True
-
-
-def route_and_compress(
-    content: str,
-    context: str = "",
-) -> str:
-    """Convenience function for one-off routing and compression.
-
-    Args:
-        content: Content to compress.
-        context: Optional context for relevance-aware compression.
-
-    Returns:
-        Compressed content.
-
-    Example:
-        >>> compressed = route_and_compress(mixed_content)
-    """
-    router = ContentRouter()
-    result = router.compress(content, context=context)
-    return result.compressed
