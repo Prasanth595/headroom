@@ -2402,6 +2402,10 @@ mod tests {
             result.original_line_count - result.compressed_line_count
         );
         assert!(level_counts.next().is_none());
+        assert_eq!(
+            marker,
+            format!("[{} lines omitted: {} INFO]", &count[1], &count[1])
+        );
         assert_eq!(result.stats["errors"], 1);
         assert_eq!(result.stats["info"], 400);
     }
@@ -2432,6 +2436,10 @@ mod tests {
                 result.original_line_count - result.compressed_line_count
             );
             assert!(!level_pattern.is_match(marker.get(0).unwrap().as_str()));
+            assert_eq!(
+                marker.get(0).unwrap().as_str(),
+                format!("[{} lines omitted]", &marker[1])
+            );
             assert!(result.compressed.lines().any(|line| line == error));
             assert_eq!(result.stats["errors"], 1);
             assert_eq!(result.stats["total"], 101);
@@ -2460,9 +2468,10 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let selected = vec![all_lines[0].clone()];
-        let (_output, stats) = c.format_output(&selected, &all_lines);
+        let (output, stats) = c.format_output(&selected, &all_lines);
         assert_eq!(stats["errors"], 1);
         assert_eq!(stats["info"], 2);
+        assert_eq!(output, "ERROR a\n[3 lines omitted: 1 WARN, 2 INFO]");
     }
 
     #[test]
@@ -2487,7 +2496,10 @@ mod tests {
             } else {
                 String::new()
             };
-            assert!(output.ends_with(&format!("; omitted: {shown}{overflow}]")));
+            assert_eq!(
+                output.lines().last().unwrap(),
+                format!("[{count} lines omitted: {count} FAIL; omitted: {shown}{overflow}]")
+            );
         }
     }
 
@@ -2509,9 +2521,10 @@ mod tests {
         ];
 
         let (output, stats) = cmp().format_output(&selected, &all_lines);
-        assert!(output.ends_with(
-            "; omitted: tests/test_ids.py::test_error, tests/test_ids.py::test_repeat, tests/test_ids.py::test_repeat]"
-        ));
+        assert_eq!(
+            output.lines().last().unwrap(),
+            "[3 lines omitted: 1 ERROR, 2 FAIL; omitted: tests/test_ids.py::test_error, tests/test_ids.py::test_repeat, tests/test_ids.py::test_repeat]"
+        );
         assert_eq!(stats["errors"], 1);
         assert_eq!(stats["fails"], 3);
     }
@@ -2546,8 +2559,9 @@ mod tests {
         );
 
         let (output, _) = c.format_output(&selected, &all_lines);
-        assert!(
-            output.ends_with("; omitted: tests/test_ids.py::test_1, tests/test_ids.py::test_2]")
+        assert_eq!(
+            output.lines().last().unwrap(),
+            "[4 lines omitted: 2 FAIL, 1 INFO; omitted: tests/test_ids.py::test_1, tests/test_ids.py::test_2]"
         );
     }
 

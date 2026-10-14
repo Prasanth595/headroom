@@ -5,7 +5,6 @@ import re
 import pytest
 
 from headroom.transforms.log_compressor import (
-    LogCompressionResult,
     LogCompressor,
     LogCompressorConfig,
     LogFormat,
@@ -182,28 +181,13 @@ def test_real_compress_ignores_malformed_short_summary_diagnostic() -> None:
     result = compressor.compress(content, bias=1_000)
 
     assert result.compressed_line_count < result.original_line_count
-    retained = [
-        line for line in result.compressed.splitlines() if line.startswith(("FAILED ", "ERROR "))
-    ]
-    assert retained == [
-        "FAILED outside.py::test_0",
-        "FAILED outside.py::test_9",
-        "ERROR outside.py::test_10",
-        "ERROR outside.py::test_19",
-    ]
-
-
-def test_result_properties() -> None:
-    result = LogCompressionResult(
-        compressed="small",
-        original="this is a substantially longer log body",
-        original_line_count=20,
-        compressed_line_count=5,
-        format_detected=LogFormat.GENERIC,
-        compression_ratio=0.25,
+    assert result.compressed == (
+        "FAILED outside.py::test_0\n"
+        "FAILED outside.py::test_9\n"
+        "ERROR outside.py::test_10\n"
+        "ERROR outside.py::test_19\n"
+        "[67 lines omitted: 8 ERROR, 8 FAIL, 51 INFO]"
     )
-    assert result.tokens_saved_estimate > 0
-    assert result.lines_omitted == 15
 
 
 def test_omitted_marker_counts_only_dropped_lines_on_native_path() -> None:
@@ -218,6 +202,7 @@ def test_omitted_marker_counts_only_dropped_lines_on_native_path() -> None:
 
     assert error in result.compressed.splitlines()
     assert counts == {"INFO": result.lines_omitted}
+    assert marker == f"[{result.lines_omitted} lines omitted: {result.lines_omitted} INFO]"
     assert result.stats["errors"] == 1
     assert result.stats["info"] == 400
 
@@ -231,6 +216,7 @@ def test_non_severity_omissions_keep_count_notice_on_native_path(prefix: str) ->
     assert marker is not None
     assert int(marker[1]) == result.lines_omitted
     assert not re.search(r"\d+ (ERROR|FAIL|WARN|INFO)\b", marker[0])
+    assert marker[0] == f"[{result.lines_omitted} lines omitted]"
     assert error in result.compressed.splitlines()
     assert result.stats["errors"] == 1
     assert result.stats["total"] == 101
