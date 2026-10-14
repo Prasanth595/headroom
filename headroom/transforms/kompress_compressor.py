@@ -1421,14 +1421,26 @@ def start_kompress_warmup_thread(model_id: str, warm: Callable[[], None]) -> thr
     on ``_kompress_lock`` and then returns the warm-up's cache entry. Registered
     before it starts, so the warm-up's initial delay is covered too.
 
-    Replaces any entry already there. If that was a live prefetch or download
-    thread, it carries on unregistered; the warm-up's own load still serializes
-    behind it on ``_kompress_lock``. Once the warm-up finishes, a failed one
-    included, the next :func:`ensure_background_download` call replaces the
-    dead entry as usual.
+    If a prefetch or download thread is already registered, the warm-up takes
+    its place in the registry and waits for it to finish before running
+    ``warm``. Without the wait, a warm-up that failed while a startup prefetch
+    was still downloading would leave the registry pointing at a dead thread,
+    and the next request would start another download next to the hidden
+    prefetch. Waiting also keeps the warm-up from fetching the same files at
+    the same time. Once the warm-up finishes, a failed one included, the next
+    :func:`ensure_background_download` call replaces the dead entry as usual.
     """
-    thread = threading.Thread(target=warm, name="kompress-warmup", daemon=True)
     with _download_threads_lock:
+        previous = _download_threads.get(model_id)
+
+        def _run() -> None:
+            # Registry entries are always started threads, so join() is safe;
+            # it returns at once for one that has already finished.
+            if previous is not None:
+                previous.join()
+            warm()
+
+        thread = threading.Thread(target=_run, name="kompress-warmup", daemon=True)
         _download_threads[model_id] = thread
         thread.start()
     return thread
