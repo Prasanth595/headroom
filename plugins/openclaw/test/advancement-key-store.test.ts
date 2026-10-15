@@ -314,6 +314,48 @@ describe("DurableAdvancementKeyStore", () => {
       await expect(new DurableAdvancementKeyStore(storePath).tryCommit("turn-late")).resolves.toBe("duplicate");
     });
 
+    it("creates markers only for the keys an older version adds when it rewrites the log", async () => {
+      await writeLegacyLog({ "turn-a": { messages: [], committedAt: "" }, "turn-b": { messages: [], committedAt: "" } });
+      const store = new DurableAdvancementKeyStore(storePath);
+      await expect(store.tryCommit("turn-new")).resolves.toBe("committed");
+
+      const internals = store as unknown as { createMarker(key: string, committedAt: string): Promise<boolean> };
+      const createMarker = internals.createMarker.bind(store);
+      const markerAttempts: string[] = [];
+      internals.createMarker = async (key, committedAt) => {
+        markerAttempts.push(key);
+        return createMarker(key, committedAt);
+      };
+      await olderVersionWrites({
+        "turn-a": { committedAt: "" },
+        "turn-b": { committedAt: "" },
+        "turn-c": { committedAt: "" },
+      });
+
+      await expect(store.tryCommit("turn-next")).resolves.toBe("committed");
+      expect(markerAttempts).toEqual(["turn-c", "turn-next"]);
+      await expect(store.tryCommit("turn-c")).resolves.toBe("duplicate");
+    });
+
+    // Permission bits don't stop root, and Windows doesn't apply them the same way.
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "keeps committing when the migration record can't be written",
+      async () => {
+        await writeLegacyLog({ "turn-old": { messages: [], committedAt: "" } });
+        // A record this process may not overwrite, say one another user wrote.
+        const record = path.join(markerDirFor(storePath), "migrated-legacy-log.json");
+        await fs.mkdir(markerDirFor(storePath), { recursive: true });
+        await fs.writeFile(record, "{}\n", "utf8");
+        await fs.chmod(record, 0o444);
+
+        const store = new DurableAdvancementKeyStore(storePath);
+        await expect(store.tryCommit("turn-old")).resolves.toBe("duplicate");
+        await expect(store.tryCommit("turn-new")).resolves.toBe("committed");
+        // A store that starts later reads the log again, and still knows its keys.
+        await expect(new DurableAdvancementKeyStore(storePath).tryCommit("turn-old")).resolves.toBe("duplicate");
+      },
+    );
+
     // Permission bits don't stop root, and Windows doesn't apply them to directories.
     it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
       "keeps commits working while the log's directory is read-only, and migrates what an older version adds later",

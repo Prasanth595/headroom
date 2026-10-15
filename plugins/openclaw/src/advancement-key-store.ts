@@ -29,7 +29,7 @@
  * already-committed turn -- exactly the failure this store exists to avoid. A
  * marker is a few dozen bytes.
  *
- * Nothing is cached in memory, and only an existing marker file counts as a
+ * No commit is cached in memory, and only an existing marker file counts as a
  * commit: a commit that fails before its marker exists (an unwritable or
  * blocked directory) is retried for real, never answered with a phantom
  * "duplicate". A marker is created before its contents are written, so
@@ -71,6 +71,8 @@ export class DurableAdvancementKeyStore {
   private readonly markerDir: string;
   /** The version of the legacy log whose keys all have markers. */
   private migratedVersion: LegacyLogVersion | undefined;
+  /** Legacy keys known to have markers, so a rewrite of the log costs only the keys it adds. */
+  private readonly migratedKeys = new Set<string>();
   private migration: Promise<void> = Promise.resolve();
 
   /**
@@ -205,7 +207,11 @@ export class DurableAdvancementKeyStore {
       ]);
     }
     for (const [key, committedAt] of entries) {
+      if (this.migratedKeys.has(key)) {
+        continue;
+      }
       await this.createMarker(key, committedAt);
+      this.migratedKeys.add(key);
     }
     // Every key in the version that was read has a marker now. Record which
     // version that was, so checks -- here and after a restart -- skip the log
@@ -213,13 +219,14 @@ export class DurableAdvancementKeyStore {
     // version still writing to it) changes it, including in the moments since
     // it was read. Moving the log aside instead would carry off whatever it
     // held by then, and leave an older version without its record.
+    this.migratedVersion = version;
     try {
       await mkdir(this.markerDir, { recursive: true });
       await writeFile(this.migratedLogRecordPath(), `${JSON.stringify(version)}\n`, "utf8");
-    } catch (error) {
-      throw this.storageError(error);
+    } catch {
+      // The record only saves work. Without it, a store that starts later
+      // reads the log again, and commits carry on meanwhile.
     }
-    this.migratedVersion = version;
   }
 
   /** Whether the log's metadata alone identifies it as the version already migrated. */
