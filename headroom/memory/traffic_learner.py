@@ -524,6 +524,8 @@ class TrafficLearner:
 
         # Background save queue
         self._save_queue: asyncio.Queue[ExtractedPattern] = asyncio.Queue(maxsize=100)
+        # Keep queued/in-flight dedup separate from confirmed persistence.
+        self._queued_hashes: set[str] = set()
         self._save_task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -550,7 +552,7 @@ class TrafficLearner:
         # Hydrate persisted dedup state before workers spin up so cross-session
         # re-sightings bump existing rows instead of creating duplicates.
         await self._hydrate_persisted_state()
-        # Rehydrate sub-threshold evidence from the previous process. Without
+        # Rehydrate pending evidence from the previous process. Without
         # this every restart zeroed pending counts, so users with short or
         # restart-heavy sessions could never cross min_evidence.
         await self._load_pending_state()
@@ -578,27 +580,15 @@ class TrafficLearner:
             except asyncio.CancelledError:
                 pass
 
-        # Drain any patterns left in the queue (worker may have been cancelled mid-flight)
+        # Failed or cancelled saves remain pending for the shutdown snapshot.
         while not self._save_queue.empty():
+            pattern = self._save_queue.get_nowait()
             try:
-                pattern = self._save_queue.get_nowait()
-                if self._backend is not None:
-                    await self._backend.save_memory(
-                        content=pattern.content,
-                        user_id=self._user_id,
-                        importance=pattern.importance,
-                        metadata={
-                            "source": "traffic_learner",
-                            "category": pattern.category.value,
-                            "evidence_count": pattern.evidence_count,
-                            **pattern.metadata,
-                        },
-                    )
-                    self._patterns_saved += 1
-            except Exception:
-                break
+                await self._save_pattern(pattern)
+            except Exception as exc:
+                logger.warning("Traffic learner shutdown save failed: %r", exc)
 
-        # Snapshot sub-threshold evidence so it survives the restart.
+        # Snapshot pending evidence so it survives the restart.
         await self._save_pending_state()
 
         # Final flush on shutdown — bypass debounce.
@@ -1273,6 +1263,8 @@ class TrafficLearner:
         self._patterns_extracted += 1
         self._flush_dirty = True
         h = pattern.content_hash
+        if h in self._queued_hashes:
+            return
 
         # Already saved — bump the persisted row's evidence_count rather
         # than creating a duplicate.
@@ -1298,66 +1290,74 @@ class TrafficLearner:
             return  # First sighting — wait for more evidence
 
         # Check if evidence threshold met
-        _, count = self._pattern_counts[h]
+        pattern, count = self._pattern_counts[h]
         if count >= self._min_evidence:
-            # Ready to save
-            del self._pattern_counts[h]
-            self._saved_hashes.add(h)
-            # Trim saved hashes to prevent unbounded growth, and drop the evicted
-            # hash's persisted-id entry in lockstep. ``_persisted_ids`` is only
-            # ever read behind an ``h in _saved_hashes`` guard (the dedup check
-            # above), so an id for a hash no longer tracked is dead weight;
-            # without this it grew one entry per distinct persisted pattern for
-            # the whole process lifetime while ``_saved_hashes`` stayed bounded.
-            if len(self._saved_hashes) > self._dedup_window:
-                # Remove oldest (arbitrary, set is unordered, but prevents growth)
-                evicted = self._saved_hashes.pop()
-                self._persisted_ids.pop(evicted, None)
-
-            # Persist the real accumulated count, not the dataclass default.
             pattern.evidence_count = count
             try:
                 self._save_queue.put_nowait(pattern)
             except asyncio.QueueFull:
-                logger.debug("Traffic learner save queue full, dropping pattern")
+                logger.debug("Traffic learner save queue full, keeping pending evidence")
+                return
+            del self._pattern_counts[h]
+            self._queued_hashes.add(h)
+
+    def _restore_pattern(self, pattern: ExtractedPattern) -> None:
+        """Keep corroborated evidence eligible after an unsuccessful save."""
+        h = pattern.content_hash
+        if (
+            h not in self._pattern_counts
+            and len(self._pattern_counts) >= self._max_pending_patterns
+        ):
+            self._pattern_counts.popitem(last=False)
+        self._pattern_counts[h] = (pattern, pattern.evidence_count)
+        self._pattern_counts.move_to_end(h)
+        self._flush_dirty = True
+
+    async def _save_pattern(self, pattern: ExtractedPattern) -> None:
+        h = pattern.content_hash
+        try:
+            if self._backend is None:
+                self._restore_pattern(pattern)
+                return
+            now_iso = datetime.now(timezone.utc).isoformat()
+            memory = await self._backend.save_memory(
+                content=pattern.content,
+                user_id=self._user_id,
+                importance=pattern.importance,
+                metadata={
+                    "source": "traffic_learner",
+                    "category": pattern.category.value,
+                    "evidence_count": pattern.evidence_count,
+                    "first_seen_at": now_iso,
+                    "last_seen_at": now_iso,
+                    **pattern.metadata,
+                },
+            )
+        except (Exception, asyncio.CancelledError):
+            self._restore_pattern(pattern)
+            raise
+        else:
+            self._patterns_saved += 1
+            self._saved_hashes.add(h)
+            if len(self._saved_hashes) > self._dedup_window:
+                self._persisted_ids.pop(self._saved_hashes.pop(), None)
+            memory_id = getattr(memory, "id", None)
+            if memory_id is not None and h in self._saved_hashes:
+                self._persisted_ids[h] = memory_id
+            logger.debug("Traffic learner saved pattern: %s", pattern.content[:80])
+        finally:
+            self._queued_hashes.discard(h)
 
     async def _save_worker(self) -> None:
         """Background worker that persists patterns to memory backend."""
         while True:
             try:
                 pattern = await self._save_queue.get()
-                if self._backend is None:
-                    continue
-
-                now_iso = datetime.now(timezone.utc).isoformat()
-                memory = await self._backend.save_memory(
-                    content=pattern.content,
-                    user_id=self._user_id,
-                    importance=pattern.importance,
-                    metadata={
-                        "source": "traffic_learner",
-                        "category": pattern.category.value,
-                        "evidence_count": pattern.evidence_count,
-                        "first_seen_at": now_iso,
-                        "last_seen_at": now_iso,
-                        **pattern.metadata,
-                    },
-                )
-                self._patterns_saved += 1
-                # Track id so future re-sightings bump this row — but only while
-                # the hash is still within the dedup window. If it was evicted
-                # from ``_saved_hashes`` between enqueue and now, recording its id
-                # would re-leak an entry that can never be read again (the dedup
-                # read at the top of ``_accumulate`` is gated on ``_saved_hashes``).
-                memory_id = getattr(memory, "id", None)
-                if memory_id is not None and pattern.content_hash in self._saved_hashes:
-                    self._persisted_ids[pattern.content_hash] = memory_id
-                logger.debug(f"Traffic learner saved pattern: {pattern.content[:80]}")
-
+                await self._save_pattern(pattern)
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.warning(f"Traffic learner save failed: {e}")
+            except Exception as exc:
+                logger.warning("Traffic learner save failed: %r", exc)
 
     async def _hydrate_persisted_state(self) -> None:
         """Load existing traffic_learner rows into _saved_hashes / _persisted_ids.
@@ -1429,7 +1429,7 @@ class TrafficLearner:
             self._persisted_ids[h] = memory_id
 
     def _pending_state_path(self) -> Path | None:
-        """Sidecar JSON next to memory.db holding sub-threshold evidence."""
+        """Sidecar JSON next to memory.db holding unsaved evidence."""
         db_path = _resolve_backend_db_path(self._backend)
         if db_path is None:
             return None
@@ -1469,7 +1469,7 @@ class TrafficLearner:
             logger.debug("Traffic learner pending-state save failed: %s", e)
 
     async def _load_pending_state(self) -> None:
-        """Rehydrate sub-threshold evidence saved by a previous process.
+        """Rehydrate unsaved evidence from a previous process.
 
         Runs after _hydrate_persisted_state so entries whose pattern crossed
         the threshold in the meantime (hash now in _saved_hashes) are skipped;
