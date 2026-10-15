@@ -26,10 +26,12 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -525,7 +527,9 @@ class TrafficLearner:
         # Background save queue
         self._save_queue: asyncio.Queue[ExtractedPattern] = asyncio.Queue(maxsize=100)
         # Keep queued/in-flight dedup separate from confirmed persistence.
-        self._queued_hashes: set[str] = set()
+        self._queued_patterns: dict[str, ExtractedPattern] = {}
+        # Keep an attempt's idempotency key until its whole evidence total is durable.
+        self._save_tokens: dict[str, str] = {}
         self._save_task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -1263,7 +1267,10 @@ class TrafficLearner:
         self._patterns_extracted += 1
         self._flush_dirty = True
         h = pattern.content_hash
-        if h in self._queued_hashes:
+        queued = self._queued_patterns.get(h)
+        if queued is not None:
+            queued.evidence_count += 1
+            queued.metadata["last_seen_at"] = datetime.now(timezone.utc).isoformat()
             return
 
         # Already saved — bump the persisted row's evidence_count rather
@@ -1285,11 +1292,15 @@ class TrafficLearner:
             # Bound the pending accumulator so one-off patterns can't grow it
             # without limit; drop the least-recently-corroborated pending entry.
             if len(self._pattern_counts) >= self._max_pending_patterns:
-                self._pattern_counts.popitem(last=False)
+                evicted, _ = self._pattern_counts.popitem(last=False)
+                self._save_tokens.pop(evicted, None)
             self._pattern_counts[h] = (pattern, 1)
 
         # Check if evidence threshold met
         pattern, count = self._pattern_counts[h]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pattern.metadata.setdefault("first_seen_at", now_iso)
+        pattern.metadata["last_seen_at"] = now_iso
         if count >= self._min_evidence:
             pattern.evidence_count = count
             try:
@@ -1298,7 +1309,7 @@ class TrafficLearner:
                 logger.debug("Traffic learner save queue full, keeping pending evidence")
                 return
             del self._pattern_counts[h]
-            self._queued_hashes.add(h)
+            self._queued_patterns[h] = pattern
 
     def _restore_pattern(self, pattern: ExtractedPattern) -> None:
         """Keep corroborated evidence eligible after an unsuccessful save."""
@@ -1307,10 +1318,44 @@ class TrafficLearner:
             h not in self._pattern_counts
             and len(self._pattern_counts) >= self._max_pending_patterns
         ):
-            self._pattern_counts.popitem(last=False)
+            evicted, _ = self._pattern_counts.popitem(last=False)
+            self._save_tokens.pop(evicted, None)
         self._pattern_counts[h] = (pattern, pattern.evidence_count)
         self._pattern_counts.move_to_end(h)
         self._flush_dirty = True
+
+    async def _find_persisted_pattern(
+        self, pattern: ExtractedPattern, save_token: str
+    ) -> tuple[str, int] | None:
+        """Resolve an uncertain local save before another insert is allowed."""
+        db_path = _resolve_backend_db_path(self._backend)
+        if db_path is None or not db_path.exists():
+            return None
+
+        def _read() -> tuple[str, int] | None:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT id, COALESCE(json_extract(metadata, '$.learner_saved_evidence'), 0) "
+                    "FROM memories WHERE user_id = ? AND content = ? "
+                    "AND json_extract(metadata, '$.source') = 'traffic_learner' "
+                    "AND json_extract(metadata, '$.category') = ? "
+                    "AND json_extract(metadata, '$.content_hash') = ? "
+                    "AND json_extract(metadata, '$.learner_save_token') = ? "
+                    "ORDER BY json_extract(metadata, '$.last_seen_at') DESC, id DESC LIMIT 1",
+                    (
+                        self._user_id,
+                        pattern.content,
+                        pattern.category.value,
+                        pattern.content_hash,
+                        save_token,
+                    ),
+                ).fetchone()
+            finally:
+                conn.close()
+            return (row[0], int(row[1])) if row is not None else None
+
+        return await asyncio.to_thread(_read)
 
     async def _save_pattern(self, pattern: ExtractedPattern) -> None:
         h = pattern.content_hash
@@ -1318,34 +1363,68 @@ class TrafficLearner:
             if self._backend is None:
                 self._restore_pattern(pattern)
                 return
-            now_iso = datetime.now(timezone.utc).isoformat()
-            memory = await self._backend.save_memory(
-                content=pattern.content,
-                user_id=self._user_id,
-                importance=pattern.importance,
-                metadata={
-                    "source": "traffic_learner",
-                    "category": pattern.category.value,
-                    "evidence_count": pattern.evidence_count,
-                    "first_seen_at": now_iso,
-                    "last_seen_at": now_iso,
-                    **pattern.metadata,
-                },
-            )
+            existing: tuple[str, int] | None = None
+            save_token = self._save_tokens.get(h)
+            if save_token is None:
+                save_token = uuid.uuid4().hex
+                self._save_tokens[h] = save_token
+            else:
+                existing = await self._find_persisted_pattern(pattern, save_token)
+            if existing is None:
+                saved_count = pattern.evidence_count
+                now_iso = datetime.now(timezone.utc).isoformat()
+                memory = await self._backend.save_memory(
+                    content=pattern.content,
+                    user_id=self._user_id,
+                    importance=pattern.importance,
+                    metadata={
+                        "source": "traffic_learner",
+                        "category": pattern.category.value,
+                        "evidence_count": saved_count,
+                        "first_seen_at": now_iso,
+                        "last_seen_at": now_iso,
+                        **pattern.metadata,
+                        "content_hash": h,
+                        "learner_save_token": save_token,
+                        "learner_saved_evidence": saved_count,
+                    },
+                )
+                memory_id = getattr(memory, "id", None)
+            else:
+                memory_id, saved_count = existing
+
+            # Observations can arrive during either the save or its index refresh.
+            # Keep ownership queued until every observed count is durable.
+            refresh = existing is not None
+            while refresh or pattern.evidence_count > saved_count:
+                if memory_id is None:
+                    raise RuntimeError("Saved learner pattern has no memory id")
+                target_count = pattern.evidence_count
+                last_seen = pattern.metadata.get("last_seen_at")
+                updated = await self._bump_persisted_evidence(
+                    memory_id,
+                    count=0,
+                    last_seen_at=last_seen if isinstance(last_seen, str) else None,
+                    save_attempt=(save_token, target_count),
+                )
+                if not updated:
+                    raise RuntimeError("Learner evidence update was not persisted")
+                saved_count = target_count
+                refresh = False
         except (Exception, asyncio.CancelledError):
             self._restore_pattern(pattern)
             raise
         else:
             self._patterns_saved += 1
             self._saved_hashes.add(h)
+            self._save_tokens.pop(h, None)
             if len(self._saved_hashes) > self._dedup_window:
                 self._persisted_ids.pop(self._saved_hashes.pop(), None)
-            memory_id = getattr(memory, "id", None)
             if memory_id is not None and h in self._saved_hashes:
                 self._persisted_ids[h] = memory_id
             logger.debug("Traffic learner saved pattern: %s", pattern.content[:80])
         finally:
-            self._queued_hashes.discard(h)
+            self._queued_patterns.pop(h, None)
 
     async def _save_worker(self) -> None:
         """Background worker that persists patterns to memory backend."""
@@ -1435,7 +1514,7 @@ class TrafficLearner:
         return db_path.with_name("pending_patterns.json")
 
     async def _save_pending_state(self) -> None:
-        """Snapshot the pending accumulator so evidence survives restarts.
+        """Snapshot pending and queued evidence so it survives restarts.
 
         Best-effort: failures are logged at debug and never propagate — the
         accumulator degrades gracefully back to per-process behavior.
@@ -1452,8 +1531,12 @@ class TrafficLearner:
                 "entity_refs": pattern.entity_refs,
                 "metadata": pattern.metadata,
                 "content_hash": h,
+                "save_token": self._save_tokens.get(h),
             }
-            for h, (pattern, count) in self._pattern_counts.items()
+            for h, (pattern, count) in chain(
+                self._pattern_counts.items(),
+                ((h, (p, p.evidence_count)) for h, p in self._queued_patterns.items()),
+            )
         ]
 
         def _write() -> None:
@@ -1470,10 +1553,10 @@ class TrafficLearner:
     async def _load_pending_state(self) -> None:
         """Rehydrate unsaved evidence from a previous process.
 
-        Runs after _hydrate_persisted_state so entries whose pattern crossed
-        the threshold in the meantime (hash now in _saved_hashes) are skipped;
-        their re-sightings bump the persisted row instead. Unreadable or
-        malformed files are ignored — the next snapshot overwrites them.
+        Runs after _hydrate_persisted_state. Confirmed patterns are skipped,
+        but an interrupted save's token keeps its pending evidence eligible
+        for reconciliation with the committed row. Unreadable or malformed
+        files are ignored — the next snapshot overwrites them.
         """
         path = self._pending_state_path()
         if path is None or not path.exists():
@@ -1489,8 +1572,16 @@ class TrafficLearner:
         for entry in entries[: self._max_pending_patterns]:
             try:
                 h = entry["content_hash"]
-                if not h or h in self._saved_hashes or h in self._pattern_counts:
+                if not h or h in self._pattern_counts:
                     continue
+                save_token = entry.get("save_token")
+                if not isinstance(save_token, str) or not save_token:
+                    save_token = None
+                if h in self._saved_hashes:
+                    if save_token is None:
+                        continue
+                    self._saved_hashes.discard(h)
+                    self._persisted_ids.pop(h, None)
                 pattern = ExtractedPattern(
                     category=PatternCategory(entry["category"]),
                     content=entry["content"],
@@ -1500,30 +1591,59 @@ class TrafficLearner:
                     content_hash=h,
                 )
                 self._pattern_counts[h] = (pattern, max(1, int(entry.get("count", 1))))
+                if save_token is not None:
+                    self._save_tokens[h] = save_token
             except Exception:
                 continue
 
-    async def _bump_persisted_evidence(self, memory_id: str) -> None:
-        """Atomically increment a persisted row's metadata.evidence_count."""
+    async def _bump_persisted_evidence(
+        self,
+        memory_id: str,
+        count: int = 1,
+        last_seen_at: str | None = None,
+        *,
+        save_attempt: tuple[str, int] | None = None,
+    ) -> bool:
+        """Atomically add evidence to a persisted row and refresh its indexes."""
         db_path = _resolve_backend_db_path(self._backend)
         if db_path is None or not db_path.exists():
-            return
+            return False
 
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = last_seen_at or datetime.now(timezone.utc).isoformat()
 
         def _bump() -> bool:
             from ..fileperms import connect_private_sqlite
 
             conn = connect_private_sqlite(db_path, what="memory store")
             try:
-                cursor = conn.execute(
-                    "UPDATE memories SET metadata = json_set("
-                    "metadata, '$.evidence_count', "
-                    "COALESCE(json_extract(metadata, '$.evidence_count'), 0) + 1, "
-                    "'$.last_seen_at', ?"
-                    ") WHERE id = ?",
-                    (now_iso, memory_id),
-                )
+                if save_attempt is None:
+                    cursor = conn.execute(
+                        "UPDATE memories SET metadata = json_set("
+                        "metadata, '$.evidence_count', "
+                        "COALESCE(json_extract(metadata, '$.evidence_count'), 0) + ?, "
+                        "'$.last_seen_at', "
+                        "MAX(COALESCE(json_extract(metadata, '$.last_seen_at'), ''), ?)"
+                        ") WHERE id = ?",
+                        (count, now_iso, memory_id),
+                    )
+                else:
+                    # A cancelled worker's SQLite write can still finish. Apply
+                    # only evidence beyond this save attempt's durable watermark.
+                    save_token, target = save_attempt
+                    cursor = conn.execute(
+                        "UPDATE memories SET metadata = json_set("
+                        "metadata, '$.evidence_count', "
+                        "COALESCE(json_extract(metadata, '$.evidence_count'), 0) + "
+                        "MAX(0, ? - COALESCE("
+                        "json_extract(metadata, '$.learner_saved_evidence'), 0)), "
+                        "'$.learner_saved_evidence', MAX(COALESCE("
+                        "json_extract(metadata, '$.learner_saved_evidence'), 0), ?), "
+                        "'$.last_seen_at', "
+                        "MAX(COALESCE(json_extract(metadata, '$.last_seen_at'), ''), ?)"
+                        ") WHERE id = ? "
+                        "AND json_extract(metadata, '$.learner_save_token') = ?",
+                        (target, target, now_iso, memory_id, save_token),
+                    )
                 conn.commit()
                 return cursor.rowcount > 0
             finally:
@@ -1533,7 +1653,7 @@ class TrafficLearner:
             updated = await asyncio.to_thread(_bump)
         except Exception as e:
             logger.debug("Traffic learner evidence bump failed for %s: %s", memory_id, e)
-            return
+            return False
 
         refresh = getattr(self._backend, "refresh_memory_indexes", None)
         if updated and refresh is not None:
@@ -1545,6 +1665,7 @@ class TrafficLearner:
                     memory_id,
                     e,
                 )
+        return updated
 
     # =========================================================================
     # Convenience: Extract from Anthropic messages format

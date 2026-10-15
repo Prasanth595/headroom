@@ -148,9 +148,14 @@ headroom proxy --codex-wire-debug
 HEADROOM_COMPRESS_PASSTHROUGH=1 headroom proxy
 ```
 
-Live learning marks a pattern as saved only after the backend confirms persistence.
-If the save queue is full or a save fails, its accumulated evidence stays eligible
-for the next sighting. Interrupted saves are retained in the shutdown snapshot.
+Live learning includes observations received while a save is queued or in flight.
+A pattern is marked as saved only after its evidence total is persisted. A full
+queue, failed save or cancellation retains the accumulated evidence for the next
+sighting and the shutdown snapshot.
+
+With LocalBackend, recovery reuses a row that committed before indexing failed
+instead of inserting another memory, and refreshes its indexes. Reconciliation
+is idempotent even when a cancelled SQLite update finishes late.
 
 <Callout type="info" title="LLMLingua removed from the proxy CLI">
 The old LLMLingua proxy toggles are no longer part of the CLI. Headroom's proxy compression path uses ContentRouter plus the current built-in compressors, including Kompress where applicable.

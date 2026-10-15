@@ -1085,9 +1085,9 @@ class _FakeBackend:
         conn = _sql.connect(self._db_path)
         try:
             conn.execute(
-                "INSERT INTO memories (id, content, metadata, entity_refs, importance) "
-                "VALUES (?,?,?,?,?)",
-                (mid, content, _json.dumps(metadata), "[]", importance),
+                "INSERT INTO memories (id, content, user_id, metadata, entity_refs, importance) "
+                "VALUES (?,?,?,?,?,?)",
+                (mid, content, user_id, _json.dumps(metadata), "[]", importance),
             )
             conn.commit()
         finally:
@@ -1102,6 +1102,7 @@ def _init_db(path):
     conn.execute(
         "CREATE TABLE memories ("
         "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+        "user_id TEXT NOT NULL DEFAULT 'default', "
         "metadata TEXT NOT NULL DEFAULT '{}', "
         "entity_refs TEXT NOT NULL DEFAULT '[]', "
         "importance REAL NOT NULL DEFAULT 0.5, "
@@ -1139,19 +1140,41 @@ async def _wait_for_saved(learner: TrafficLearner, count: int, db_path) -> None:
     )
 
 
+async def _wait_for_evidence(db_path, content, count):
+    for _ in range(100):
+        found = [
+            meta["evidence_count"]
+            for _, text, meta in _read_traffic_rows(db_path)
+            if text == content
+        ]
+        if found == [count]:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"Expected one row with evidence {count}; got {found}")
+
+
 class _ObservedBackend(_FakeBackend):
     def __init__(self, db_path):
         super().__init__(db_path)
         self.entered = asyncio.Event()
         self.attempted = asyncio.Event()
         self.release = None
+        self.committed = asyncio.Event()
+        self.after_commit_release = None
+        self.fail_after_commit = False
 
     async def save_memory(self, **kwargs):
         self.entered.set()
         try:
             if self.release is not None:
                 await self.release.wait()
-            return await super().save_memory(**kwargs)
+            memory = await super().save_memory(**kwargs)
+            self.committed.set()
+            if self.after_commit_release is not None:
+                await self.after_commit_release.wait()
+            if self.fail_after_commit:
+                raise RuntimeError("indexing failed after commit")
+            return memory
         finally:
             self.attempted.set()
 
@@ -1180,10 +1203,14 @@ class TestSaveRecovery:
                 "BEGIN SELECT RAISE(ABORT, 'backend unavailable'); END"
             )
         backend = _ObservedBackend(db)
+        backend.release = asyncio.Event()
         learner = TrafficLearner(backend=backend, min_evidence=3)
         await learner.start()
         try:
             await self._feed(learner, "Use uv for Python packages.", 3)
+            await asyncio.wait_for(backend.entered.wait(), 2)
+            await self._feed(learner, "Use uv for Python packages.", 2)
+            backend.release.set()
             await asyncio.wait_for(backend.attempted.wait(), 2)
             assert _read_traffic_rows(db) == []
             with sqlite3.connect(db) as conn:
@@ -1195,7 +1222,112 @@ class TestSaveRecovery:
         rows = _read_traffic_rows(db)
         assert len(rows) == 1
         assert rows[0][1] == "Use uv for Python packages."
-        assert rows[0][2]["evidence_count"] == 4
+        assert rows[0][2]["evidence_count"] == 6
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("in_flight", [False, True])
+    async def test_queued_and_inflight_observations_reach_the_saved_row(self, tmp_path, in_flight):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.release = asyncio.Event()
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        content = "Use uv for Python packages."
+        try:
+            if in_flight:
+                await learner.start()
+                await self._feed(learner, content, 3)
+                await asyncio.wait_for(backend.entered.wait(), 2)
+                await self._feed(learner, content, 2)
+                backend.release.set()
+            else:
+                await self._feed(learner, content, 5)
+                backend.release.set()
+                await learner.start()
+            await _wait_for_evidence(db, content, 5)
+        finally:
+            backend.release.set()
+            await learner.stop()
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 5
+        assert _parse_iso_timestamp(rows[0][2]["last_seen_at"]) >= _parse_iso_timestamp(
+            rows[0][2]["first_seen_at"]
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancelled", [False, True])
+    async def test_postcommit_failure_or_cancellation_reuses_the_committed_row(
+        self, tmp_path, cancelled
+    ):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.after_commit_release = asyncio.Event()
+        backend.fail_after_commit = not cancelled
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        content = "Use uv for Python packages."
+        await learner.start()
+        try:
+            await self._feed(learner, content, 3)
+            await asyncio.wait_for(backend.committed.wait(), 2)
+            committed = _read_traffic_rows(db)
+            assert len(committed) == 1
+            assert committed[0][2]["evidence_count"] == 3
+            await self._feed(learner, content, 2)
+            if cancelled:
+                await learner.stop()
+                learner = TrafficLearner(backend=backend, min_evidence=3)
+                await learner.start()
+            else:
+                backend.after_commit_release.set()
+                await asyncio.wait_for(backend.attempted.wait(), 2)
+            backend.fail_after_commit = False
+            backend.after_commit_release.set()
+            await self._feed(learner, content, 1)
+            await _wait_for_evidence(db, content, 6)
+        finally:
+            backend.after_commit_release.set()
+            await learner.stop()
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][0] == committed[0][0]
+        assert rows[0][2]["evidence_count"] == 6
+
+    @pytest.mark.asyncio
+    async def test_late_reconciliation_preserves_other_and_already_counted_sightings(
+        self, tmp_path
+    ):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        memory = await backend.save_memory(
+            content="Use uv for Python packages.",
+            user_id="default",
+            importance=0.7,
+            metadata={
+                "source": "traffic_learner",
+                "evidence_count": 3,
+                "learner_save_token": "save-attempt",
+                "learner_saved_evidence": 3,
+            },
+        )
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        await learner._bump_persisted_evidence(
+            memory.id, last_seen_at="2024-01-02T00:00:00+00:00", save_attempt=("save-attempt", 5)
+        )
+        await learner._bump_persisted_evidence(memory.id, last_seen_at="2024-01-04T00:00:00+00:00")
+        await learner._bump_persisted_evidence(
+            memory.id, last_seen_at="2024-01-03T00:00:00+00:00", save_attempt=("save-attempt", 6)
+        )
+        await learner._bump_persisted_evidence(
+            memory.id, last_seen_at="2024-01-02T00:00:00+00:00", save_attempt=("save-attempt", 5)
+        )
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 7
+        assert rows[0][2]["learner_saved_evidence"] == 6
+        assert rows[0][2]["last_seen_at"] == "2024-01-04T00:00:00+00:00"
 
     @pytest.mark.asyncio
     async def test_full_queue_preserves_evidence_for_a_later_sighting(self, tmp_path):
@@ -1227,6 +1359,7 @@ class TestSaveRecovery:
         await learner.start()
         await self._feed(learner, "Use uv for Python packages.", 3)
         await asyncio.wait_for(backend.entered.wait(), 2)
+        await self._feed(learner, "Use uv for Python packages.", 2)
         await learner.stop()
         restarted = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
         await restarted.start()
@@ -1237,7 +1370,7 @@ class TestSaveRecovery:
             await restarted.stop()
         rows = _read_traffic_rows(db)
         assert len(rows) == 1
-        assert rows[0][2]["evidence_count"] == 4
+        assert rows[0][2]["evidence_count"] == 6
 
 
 class TestEvidencePersistence:
