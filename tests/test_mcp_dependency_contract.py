@@ -16,14 +16,16 @@ def _mcp_requirement(dependencies: list[str]) -> Requirement:
     return matches[0]
 
 
-def test_all_shipping_mcp_extras_exclude_incompatible_sdk_v2() -> None:
-    """SDK 2 removed Server.list_tools()/call_tool(); #2658 owns that port."""
+def test_all_shipping_mcp_extras_require_the_ported_sdk_v2() -> None:
+    """The shipped servers use SDK 2 constructor callbacks, not SDK 1 decorators."""
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     optional = project["optional-dependencies"]
 
     for extra in ("proxy", "mcp"):
         requirement = _mcp_requirement(optional[extra])
-        assert requirement.specifier.contains("1.28.1")
-        assert not requirement.specifier.contains("2.0.0"), (
-            f"the {extra!r} extra admits MCP SDK 2.x before the server port in #2658"
+        assert requirement.specifier.contains("2.0.0"), (
+            f"the {extra!r} extra must admit the SDK used by the ported servers"
+        )
+        assert not requirement.specifier.contains("1.28.1"), (
+            f"the {extra!r} extra admits SDK 1 without the required constructor callbacks"
         )
