@@ -67,8 +67,11 @@ routes, even if only its JSON section saves tokens.
 Minification takes precedence over lossy fallbacks when it saves tokens;
 already-compact input can still reach the existing fallback chain. For tool
 results with CCR enabled, each changed lossy mixed section must carry its own
-retrieval marker. A marker on another section does not authorize dropping its
-data, and rejected mixed results do not enter the tool-result cache.
+retrieval marker. Embedded JSON carries reversibility separately for each adopted
+span: lossless minification needs no marker, while a marker on another span or
+section does not authorize dropping its data. Candidates rejected by the token
+benefit gate do not affect the adopted spans' reversibility. Rejected mixed
+results do not enter the tool-result cache.
 
 ### Comparing historical TOIN data
 

@@ -1463,10 +1463,12 @@ class TestSmartCrusherFallback:
             ),
         )
 
-        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-            content,
-            CompressionStrategy.SMART_CRUSHER,
-            context="",
+        compressed, compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                content,
+                CompressionStrategy.SMART_CRUSHER,
+                context="",
+            )
         )
 
         # Strategy chain must include smart_crusher
@@ -1508,10 +1510,12 @@ class TestSmartCrusherFallback:
             lambda self: mock_crusher,
         )
 
-        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-            content,
-            CompressionStrategy.SMART_CRUSHER,
-            context="",
+        compressed, compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                content,
+                CompressionStrategy.SMART_CRUSHER,
+                context="",
+            )
         )
 
         # SmartCrusher should handle JSON directly
@@ -1566,10 +1570,12 @@ class TestSmartCrusherFallback:
             ),
         )
 
-        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-            repetitive,
-            CompressionStrategy.SMART_CRUSHER,
-            context="",
+        compressed, compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                repetitive,
+                CompressionStrategy.SMART_CRUSHER,
+                context="",
+            )
         )
 
         # The chain must include the requested strategy
@@ -1599,10 +1605,12 @@ class TestSmartCrusherFallback:
 
         plain = "This is just plain text. " * 200
 
-        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-            plain,
-            CompressionStrategy.CODE_AWARE,
-            context="",
+        compressed, compressed_tokens, strategy_chain, _reversible = (
+            router._apply_strategy_to_content(
+                plain,
+                CompressionStrategy.CODE_AWARE,
+                context="",
+            )
         )
 
         # CodeAware should be in the chain
@@ -1829,7 +1837,7 @@ class TestMixedContentTagProtection:
         router = ContentRouter(ContentRouterConfig(min_section_tokens=1))
 
         def mangle(content, strategy, context, language=None, question=None, bias=1.0):
-            return "MANGLED", 1, None
+            return "MANGLED", 1, [strategy.value], False
 
         router._apply_strategy_to_content = mangle  # type: ignore[method-assign]
         return router

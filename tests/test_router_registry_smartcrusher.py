@@ -36,7 +36,7 @@ def test_json_minification_precedes_fallback_without_losing_records(pretty: bool
             ccr_inject_marker=False,
         )
     )
-    compressed, tokens, chain = router._apply_strategy_to_content(
+    compressed, tokens, chain, _reversible = router._apply_strategy_to_content(
         content, CompressionStrategy.SMART_CRUSHER, "CRITICAL_20"
     )
 
