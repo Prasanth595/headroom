@@ -249,16 +249,23 @@ describe("DurableAdvancementKeyStore", () => {
       await fs.writeFile(storePath, JSON.stringify(contents), "utf8");
     }
 
-    it("keeps its keys committed and retires the file", async () => {
+    /** Rewrite the log the way an older version commits a key: a temp file renamed over it. */
+    async function olderVersionWrites(contents: unknown): Promise<void> {
+      const temp = `${storePath}.tmp`;
+      await fs.writeFile(temp, JSON.stringify(contents), "utf8");
+      await fs.rename(temp, storePath);
+    }
+
+    it("keeps its keys committed and leaves the file as it was, for any older version still using it", async () => {
       await writeLegacyLog({
         "turn-old": { messages: [{ role: "user", content: "hi" }], committedAt: "2026-10-01T00:00:00.000Z" },
       });
+      const log = await fs.readFile(storePath, "utf8");
       const store = new DurableAdvancementKeyStore(storePath);
 
       await expect(store.tryCommit("turn-old")).resolves.toBe("duplicate");
       await expect(store.tryCommit("turn-new")).resolves.toBe("committed");
-      await expect(fs.access(storePath)).rejects.toThrow();
-      await expect(fs.access(`${storePath}.migrated`)).resolves.toBeUndefined();
+      await expect(fs.readFile(storePath, "utf8")).resolves.toBe(log);
     });
 
     it("reads the key-only array format too", async () => {
@@ -280,12 +287,39 @@ describe("DurableAdvancementKeyStore", () => {
       expect(results).toEqual(["duplicate", "duplicate"]);
     });
 
+    it("never re-accepts a key an older version commits while the log is being migrated", async () => {
+      await writeLegacyLog({ "turn-a": { messages: [], committedAt: "" }, "turn-b": { messages: [], committedAt: "" } });
+      const store = new DurableAdvancementKeyStore(storePath);
+      // The older version commits turn-late after this store has read the log,
+      // while it is creating the markers for what it read.
+      const internals = store as unknown as { createMarker(key: string, committedAt: string): Promise<boolean> };
+      const createMarker = internals.createMarker.bind(store);
+      let olderVersionCommitted = false;
+      internals.createMarker = async (key, committedAt) => {
+        if (!olderVersionCommitted) {
+          olderVersionCommitted = true;
+          await olderVersionWrites({
+            "turn-a": { committedAt: "" },
+            "turn-b": { committedAt: "" },
+            "turn-late": { committedAt: "" },
+          });
+        }
+        return createMarker(key, committedAt);
+      };
+
+      await expect(store.tryCommit("turn-new")).resolves.toBe("committed");
+      expect(olderVersionCommitted).toBe(true);
+      await expect(store.has("turn-late")).resolves.toBe(true);
+      await expect(store.tryCommit("turn-late")).resolves.toBe("duplicate");
+      await expect(new DurableAdvancementKeyStore(storePath).tryCommit("turn-late")).resolves.toBe("duplicate");
+    });
+
     // Permission bits don't stop root, and Windows doesn't apply them to directories.
     it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
       "keeps commits working while the log's directory is read-only, and migrates what an older version adds later",
       async () => {
         // A writable marker volume mounted beneath a read-only directory that
-        // holds the legacy log: its keys migrate, but the log can't be renamed.
+        // holds the legacy log: its keys migrate without writing to that directory.
         await writeLegacyLog({ "turn-a": { messages: [], committedAt: "" } });
         const written = new Date("2026-10-01T00:00:00.000Z");
         await fs.utimes(storePath, written, written);
@@ -312,18 +346,10 @@ describe("DurableAdvancementKeyStore", () => {
 
           // The directory becomes writable, and an older version that is still
           // running commits turn-b the way it always did (temp file + rename).
-          // The running store migrates it before its next commit, and can now
-          // retire the log.
+          // The running store migrates it before its next commit.
           await fs.chmod(logDir, 0o755);
-          const temp = `${storePath}.tmp`;
-          await fs.writeFile(
-            temp,
-            JSON.stringify({ "turn-a": { committedAt: "" }, "turn-b": { committedAt: "" } }),
-            "utf8",
-          );
-          await fs.rename(temp, storePath);
+          await olderVersionWrites({ "turn-a": { committedAt: "" }, "turn-b": { committedAt: "" } });
           await expect(restarted.tryCommit("turn-b")).resolves.toBe("duplicate");
-          await expect(fs.access(`${storePath}.migrated`)).resolves.toBeUndefined();
         } finally {
           await fs.chmod(logDir, 0o755);
         }

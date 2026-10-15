@@ -39,7 +39,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstat, mkdir, open, readFile, rename, stat, writeFile, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import * as os from "node:os";
 
@@ -69,7 +69,7 @@ function sameVersion(a: LegacyLogVersion | undefined, b: LegacyLogVersion): bool
 
 export class DurableAdvancementKeyStore {
   private readonly markerDir: string;
-  /** The version of a legacy log left in place whose keys all have markers. */
+  /** The version of the legacy log whose keys all have markers. */
   private migratedVersion: LegacyLogVersion | undefined;
   private migration: Promise<void> = Promise.resolve();
 
@@ -77,10 +77,10 @@ export class DurableAdvancementKeyStore {
    * `path` names the commit log; the markers live in `markerDirFor(path)`.
    * Versions that kept every key in the log file itself may have left one at
    * `path`. Before every commit and lookup, a log there that is new or has
-   * changed has its keys migrated to markers, and is then renamed to
-   * `<path>.migrated` -- or, if its directory is read-only, left in place.
-   * A key that an older version still writing to it adds, even while this
-   * store is running, is therefore migrated before this store's next commit.
+   * changed has its keys migrated to markers. The log itself is never moved or
+   * changed, so an older version still running against the same workspace
+   * keeps its own record, and every key it commits, even while this store is
+   * migrating the log, is migrated before this store's next commit.
    */
   constructor(private readonly path: string) {
     this.markerDir = markerDirFor(path);
@@ -92,7 +92,7 @@ export class DurableAdvancementKeyStore {
     return join(this.markerDir, digest.slice(0, 2), digest);
   }
 
-  /** Records which version of a legacy log was migrated but couldn't be renamed. */
+  /** Records which version of the legacy log was migrated last. */
   private migratedLogRecordPath(): string {
     return join(this.markerDir, "migrated-legacy-log.json");
   }
@@ -162,8 +162,7 @@ export class DurableAdvancementKeyStore {
    * Move the keys of a legacy single-file log into markers. Without a log this
    * is one failed open(), and with an unchanged one an open() and an fstat(), so
    * it runs before every commit. Safe to run in several processes at once:
-   * creating a marker that already exists is a no-op, and only one rename of
-   * the old file can succeed.
+   * creating a marker that already exists is a no-op.
    */
   private async migrateLegacyLog(): Promise<void> {
     let log: FileHandle;
@@ -208,29 +207,19 @@ export class DurableAdvancementKeyStore {
     for (const [key, committedAt] of entries) {
       await this.createMarker(key, committedAt);
     }
+    // Every key in the version that was read has a marker now. Record which
+    // version that was, so checks -- here and after a restart -- skip the log
+    // while it is unchanged, and migrate it again once anything (an older
+    // version still writing to it) changes it, including in the moments since
+    // it was read. Moving the log aside instead would carry off whatever it
+    // held by then, and leave an older version without its record.
     try {
-      await rename(this.path, `${this.path}.migrated`);
+      await mkdir(this.markerDir, { recursive: true });
+      await writeFile(this.migratedLogRecordPath(), `${JSON.stringify(version)}\n`, "utf8");
     } catch (error) {
-      const code = errorCode(error);
-      if (code === "ENOENT") {
-        return; // Another process migrated the same log first.
-      }
-      if (code !== "EACCES" && code !== "EPERM" && code !== "EROFS") {
-        throw error;
-      }
-      // The log's directory is read-only (say, a writable marker volume mounted
-      // beneath it), so the log stays. Every key it held has a marker now:
-      // record which version of the file that was, so checks -- here and after
-      // a restart -- skip it while it is unchanged, and migrate it again once
-      // anything (an older version still writing to it) changes it.
-      try {
-        await mkdir(this.markerDir, { recursive: true });
-        await writeFile(this.migratedLogRecordPath(), `${JSON.stringify(version)}\n`, "utf8");
-      } catch (recordError) {
-        throw this.storageError(recordError);
-      }
-      this.migratedVersion = version;
+      throw this.storageError(error);
     }
+    this.migratedVersion = version;
   }
 
   /** Whether the log's metadata alone identifies it as the version already migrated. */
