@@ -1965,11 +1965,13 @@ def _setup_file_logging(
         _warn_once_if_not_protected(log_path)
     except OSError as exc:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.). Say so,
-        # or the missing proxy.log is the only clue. The OSError names the path.
+        # or the missing proxy.log is the only clue. str(exc) embeds repr(filename),
+        # which doubles backslashes on Windows -- exc.filename is the raw path.
         logger.warning(
-            "Headroom runtime log disabled: cannot write the log file: %s. "
+            "Headroom runtime log disabled: cannot write the log file: %s: %s. "
             "Point HEADROOM_WORKSPACE_DIR at a writable directory to restore proxy.log.",
-            exc,
+            exc.filename or log_dir,
+            exc.strerror or exc,
         )
 
 
