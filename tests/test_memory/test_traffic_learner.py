@@ -1242,6 +1242,38 @@ class TestSaveRecovery:
 
 class TestEvidencePersistence:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("min_evidence", [1, 2, 5])
+    async def test_persists_at_configured_evidence_threshold(self, tmp_path, min_evidence):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        learner = TrafficLearner(backend=_FakeBackend(db), min_evidence=min_evidence)
+        await learner.start()
+        try:
+            for _ in range(min_evidence - 1):
+                await learner._accumulate(
+                    ExtractedPattern(
+                        category=PatternCategory.PREFERENCE,
+                        content="Use uv for Python packages.",
+                        importance=0.7,
+                    )
+                )
+            assert _read_traffic_rows(db) == []
+            await learner._accumulate(
+                ExtractedPattern(
+                    category=PatternCategory.PREFERENCE,
+                    content="Use uv for Python packages.",
+                    importance=0.7,
+                )
+            )
+            await _wait_for_saved(learner, 1, db)
+        finally:
+            await learner.stop()
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][1] == "Use uv for Python packages."
+        assert rows[0][2]["evidence_count"] == min_evidence
+
+    @pytest.mark.asyncio
     async def test_save_persists_actual_evidence_count(self, tmp_path):
         """The count written to the DB reflects total sightings, not the default 1."""
         db = tmp_path / "memory.db"

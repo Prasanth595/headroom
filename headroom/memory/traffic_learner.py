@@ -1287,7 +1287,6 @@ class TrafficLearner:
             if len(self._pattern_counts) >= self._max_pending_patterns:
                 self._pattern_counts.popitem(last=False)
             self._pattern_counts[h] = (pattern, 1)
-            return  # First sighting — wait for more evidence
 
         # Check if evidence threshold met
         pattern, count = self._pattern_counts[h]

@@ -137,7 +137,7 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy --port 8787
 | `--memory-top-k` | `10` | Number of memories to inject as context |
 | `--learn` | `false` | Enable live traffic learning; implies `--memory` |
 | `--no-learn` | `false` | Explicitly disable traffic learning |
-| `--min-evidence` | `5` | Minimum observations before a learned pattern is persisted |
+| `--min-evidence` | `5` | Minimum observations before a learned pattern is persisted; `1` saves the first sighting |
 | `--codex-wire-debug` | `false` | Write local Codex wire snapshots and matching proxy log traces |
 | `HEADROOM_COMPRESS_PASSTHROUGH` | `0` | Also compress custom proxy paths that fall through to the catch-all handler (OpenAI Responses-shaped bodies, path ends in `/responses`). No `--compress-passthrough` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one |
 
