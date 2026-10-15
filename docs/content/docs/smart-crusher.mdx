@@ -64,6 +64,11 @@ Because no information is offloaded, lossless minification does not store an
 original or append a CCR retrieval marker: the forwarded value remains valid
 JSON. A mixed document still reports `mixed` when its sections take different
 routes, even if only its JSON section saves tokens.
+Minification takes precedence over lossy fallbacks when it saves tokens;
+already-compact input can still reach the existing fallback chain. For tool
+results with CCR enabled, each changed lossy mixed section must carry its own
+retrieval marker. A marker on another section does not authorize dropping its
+data, and rejected mixed results do not enter the tool-result cache.
 
 ### Comparing historical TOIN data
 

@@ -1077,49 +1077,6 @@ def test_relevance_split_does_not_fragment_json_payloads(
     assert kompress_inputs == []
 
 
-def test_smart_crusher_log_fallback_runs_for_valid_json(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Valid JSON arrays still reach the Log fallback when SmartCrusher no-ops.
-
-    The JSON-validity guard (#1306) only blocks the Log fallback for
-    *invalid* JSON. Valid JSON arrays that SmartCrusher can't shrink (e.g.
-    repetitive JSONL the proxy's own log dumps) still get the Log fallback,
-    which is the intended "repetitive JSONL" path.
-    """
-    router = ContentRouter(ContentRouterConfig())
-    valid_json = '[{"a": 1}, {"a": 1}, {"a": 1}, {"a": 1}]'
-
-    class NoopSmartCrusher:
-        def crush(self, content: str, query: str = "", bias: float = 1.0) -> SimpleNamespace:
-            return SimpleNamespace(compressed=content)
-
-    class ShrinkingLogCompressor:
-        def compress(self, content: str, bias: float = 1.0) -> SimpleNamespace:
-            return SimpleNamespace(compressed="[compressed]")
-
-    monkeypatch.setattr(router, "_get_smart_crusher", lambda: NoopSmartCrusher())
-    monkeypatch.setattr(router, "_get_log_compressor", lambda: ShrinkingLogCompressor())
-    # Kompress no-op → Log fallback fires. A faithful no-op reports the same
-    # token count the router computed for the (unchanged) content — using
-    # _estimate_tokens, not a naive word split, so it isn't mistaken for a
-    # saving once #1857's whitespace-aware counting rates the JSON above 8.
-    monkeypatch.setattr(
-        router,
-        "_try_ml_compressor",
-        lambda content, context, question=None: (content, _estimate_tokens(content)),
-    )
-
-    compressed, _compressed_tokens, strategy_chain = router._apply_strategy_to_content(
-        valid_json,
-        CompressionStrategy.SMART_CRUSHER,
-        context="",
-    )
-
-    assert CompressionStrategy.LOG.value in strategy_chain
-    assert compressed == "[compressed]"
-
-
 # ---------------------------------------------------------------------------
 # MIXED false-positive on source code: Python with dict literals + docstrings
 # triggers ``has_json_blocks`` and ``has_prose`` in ``is_mixed_content``,
@@ -2788,3 +2745,71 @@ def test_code_aware_noop_keeps_a_smaller_inline_kompress(
     assert compressed_tokens == _estimate_tokens(kompressed)
     assert strategy_chain == ["code_aware", "kompress"]
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("as_block", [False, True], ids=["string-tool", "tool-result-block"])
+@pytest.mark.parametrize("other_marker", [False, True], ids=["no-marker", "unrelated-marker"])
+@pytest.mark.parametrize("ccr_enabled", [False, True], ids=["explicit-no-ccr", "reversible-tools"])
+def test_mixed_lossy_section_cannot_borrow_another_sections_retrieval_marker(
+    monkeypatch, as_block, other_marker, ccr_enabled
+) -> None:
+    router = ContentRouter(
+        ContentRouterConfig(
+            enable_code_aware=True,
+            enable_kompress=False,
+            min_chars_for_block_compression=0,
+            protect_recent_code=0,
+            protect_analysis_context=False,
+            ccr_inject_marker=ccr_enabled,
+        )
+    )
+    code = (
+        "def account():\n"
+        + "".join(
+            f"    # audit record {i}: preserve the complete account history.\n" for i in range(120)
+        )
+        + '    identifier = "ACCOUNT_ID_42"\n    return identifier\n'
+    )
+    content = "```python\n" + code + "```\n\n" + '[{"flag":true,"value":7}]'
+    if other_marker:
+        content += "\n\nIndependent retained section <<ccr:123456789012>>"
+
+    def compress_section(section, strategy, *_args, **_kwargs):
+        # Control only the lossy compressor boundary; split/routing/guards are real.
+        compressed = (
+            section.replace("ACCOUNT_ID_42", "")
+            if strategy is CompressionStrategy.CODE_AWARE
+            else section
+        )
+        return compressed, _estimate_tokens(compressed), [strategy.value]
+
+    monkeypatch.setattr(router, "_apply_strategy_to_content", compress_section)
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda c, context="", bias=1.0, precomputed_detection=None: router._compress_mixed(
+            c, context, bias=bias
+        ),
+    )
+    direct = router.compress(content)
+    assert direct.strategy_used is CompressionStrategy.MIXED
+    assert direct.compression_ratio < 1.0
+    assert "ACCOUNT_ID_42" not in direct.compressed
+
+    message = (
+        _tool_result_block_msg(content)
+        if as_block
+        else {"role": "tool", "tool_call_id": "account", "content": content}
+    )
+    for _turn in range(2):
+        result = router.apply([message], _ChurnTokenizer(), model_limit=100_000)
+        output = (
+            result.messages[0]["content"][0]["content"]
+            if as_block
+            else result.messages[0]["content"]
+        )
+        if ccr_enabled or other_marker:
+            assert output == content
+        else:
+            assert "ACCOUNT_ID_42" not in output
+            assert '[{"flag":true,"value":7}]' in output

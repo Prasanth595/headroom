@@ -1784,6 +1784,8 @@ class RouterCompressionResult:
             LOG fallback chain it's three. Lets log readers see *how*
             we got to the final compressor without parsing the
             decision_reason string.
+        unrecoverable_sections: A changed lossy mixed section lacks its own
+            retrieval marker, independently of markers on other sections.
         cache_hit: True when this result was reused from a cache
             instead of a fresh compression run. compress() itself
             never sets this (only apply() has the router-internal
@@ -1799,6 +1801,7 @@ class RouterCompressionResult:
     sections_processed: int = 1
     strategy_chain: list[str] = field(default_factory=list)
     cache_hit: bool = False
+    unrecoverable_sections: bool = False
 
     @property
     def total_original_tokens(self) -> int:
@@ -3195,6 +3198,7 @@ class ContentRouter(Transform):
 
         compressed_sections: list[str] = []
         routing_log: list[RoutingDecision] = []
+        unrecoverable_sections = False
 
         for i, section in enumerate(sections):
             if placeholders and any(ph in section.content for ph in placeholders):
@@ -3227,6 +3231,16 @@ class ContentRouter(Transform):
             if _section_chain == [CompressionStrategy.JSON_MINIFIER.value]:
                 strategy = CompressionStrategy.JSON_MINIFIER
 
+            pure_lossless = bool(_section_chain) and all(
+                step.startswith("lossless_") for step in _section_chain
+            )
+            if (
+                compressed_content != section.content
+                and strategy in self.LOSSY_UNMARKED_STRATEGIES
+                and not pure_lossless
+                and not CCR_RETRIEVAL_MARKER_RE.search(compressed_content)
+            ):
+                unrecoverable_sections = True
             # Preserve code fence markers
             if section.is_code_fence and section.language:
                 compressed_content = f"```{section.language}\n{compressed_content}\n```"
@@ -3275,6 +3289,7 @@ class ContentRouter(Transform):
             ),
             routing_log=routing_log,
             sections_processed=len(sections),
+            unrecoverable_sections=unrecoverable_sections,
         )
 
     def _compress_pure(
@@ -6712,8 +6727,13 @@ class ContentRouter(Transform):
                     if (
                         enforce_rev
                         and self.config.ccr_inject_marker
-                        and result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
-                        and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                        and (
+                            getattr(result, "unrecoverable_sections", False)
+                            or (
+                                result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
+                                and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                            )
+                        )
                     ):
                         self._cache.mark_skip(content_key)
                         result_slots[slot_idx] = message
@@ -7803,8 +7823,13 @@ class ContentRouter(Transform):
             if (
                 enforce_reversibility
                 and self.config.ccr_inject_marker
-                and result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
-                and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                and (
+                    getattr(result, "unrecoverable_sections", False)
+                    or (
+                        result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
+                        and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                    )
+                )
             ):
                 self._cache.mark_skip(content_key)
                 if route_counts is not None:
