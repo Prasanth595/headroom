@@ -2196,6 +2196,12 @@ class HeadroomProxy(
             self._kompress_status = eager_status["kompress"]
         if eager_status.get("code_aware") == "enabled":
             self._code_aware_status = "enabled"
+        kompress_enabled = any(
+            transform.config.enable_kompress
+            for pipeline in (self.anthropic_pipeline, self.openai_pipeline)
+            for transform in pipeline.transforms
+            if isinstance(transform, ContentRouter)
+        )
 
         # Log component status
         if self._kompress_status == "enabled":
@@ -2205,6 +2211,13 @@ class HeadroomProxy(
                 logger.info("Kompress: DEFERRED (warming in the background after startup)")
             else:
                 logger.info("Kompress: DEFERRED (model loads on first request)")
+        elif not kompress_enabled and (
+            self.config.optimize
+            or self.config.disable_kompress
+            or self.config.disable_kompress_anthropic is True
+            or self.config.disable_kompress_openai is True
+        ):
+            logger.info("Kompress: DISABLED")
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
