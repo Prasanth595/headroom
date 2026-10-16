@@ -17,17 +17,41 @@ def render_embedding_input(
     user_text: str,
     recent_tool_outputs: tuple[str, ...],
     recent_assistant_turns: tuple[str, ...],
+    max_chars: int | None = None,
 ) -> str:
-    """Concatenate memory query sources into a delimited embedding input."""
+    """Render full sources, or a user-first query within an embedding budget."""
     parts: list[str] = []
-    for asst in recent_assistant_turns:
-        if asst:
-            parts.append(ASSISTANT_DELIM + asst)
-    for tool_out in recent_tool_outputs:
-        if tool_out:
-            parts.append(TOOL_DELIM + tool_out)
+    if max_chars is None:
+        for asst in recent_assistant_turns:
+            if asst:
+                parts.append(ASSISTANT_DELIM + asst)
+        for tool_out in recent_tool_outputs:
+            if tool_out:
+                parts.append(TOOL_DELIM + tool_out)
+        if user_text:
+            parts.append(USER_DELIM + user_text)
+        return "".join(parts)
+
+    remaining = max(0, max_chars)
     if user_text:
-        parts.append(USER_DELIM + user_text)
+        user_chars = min(2048, remaining - len(USER_DELIM))
+        if user_chars > 0:
+            part = USER_DELIM + user_text[-user_chars:]
+            parts.append(part)
+            remaining -= len(part)
+    for delimiter, sources in (
+        (TOOL_DELIM, recent_tool_outputs),
+        (ASSISTANT_DELIM, recent_assistant_turns),
+    ):
+        for source in reversed(sources):
+            if not source:
+                continue
+            source_chars = min(512, remaining - len(delimiter))
+            if source_chars <= 0:
+                break
+            part = delimiter + source[-source_chars:]
+            parts.append(part)
+            remaining -= len(part)
     return "".join(parts)
 
 

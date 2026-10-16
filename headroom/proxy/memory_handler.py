@@ -797,17 +797,17 @@ class MemoryHandler:
             )
             return None
 
-        # Build the embedding query. When the handler provides a
-        # MemoryQuery, use its multi-source untruncated input; otherwise
-        # fall back to extracting from messages (kept for legacy callers
-        # / tests). Full fidelity in both paths.
+        # Bound the derived embedding input, not the MemoryQuery's raw sources.
+        # Prefer the user's question and recent context tails while keeping
+        # embedding work independent of the full tool-output size.
         if query is not None:
-            query_text = query.to_embedding_input()
+            query_text = query.to_embedding_input(max_chars=4096)
         else:
             query_text = self._extract_user_query(messages)
         if not query_text:
             logger.debug("Memory: No query text for context search")
             return None
+        query_text = query_text[-4096:]
 
         # Compose the budget: explicit per-call wins; otherwise derive
         # from self.config so existing top_k/min_similarity callers see
@@ -868,7 +868,7 @@ class MemoryHandler:
                     memory_lines.append(f"   (Related: {entities_str})")
 
         except Exception as e:
-            logger.warning(f"Memory: Search failed for user {effective_user_id}: {e}")
+            logger.warning(f"Memory: Search failed for user {effective_user_id}: {e!r}")
             return None
 
         if not memory_lines:
@@ -901,10 +901,8 @@ pass that ID directly to memory_update or memory_delete — you do not need \
 to call memory_search first to discover IDs. Use this context to inform \
 your responses, not to drive new actions."""
 
-        # Apply the token-budget cap on the formatted block. Pre-this-
-        # PR there was no cap — up to ~4000 tokens could be injected
-        # per request. The budget bounds the output without touching
-        # the input query (which stays full-fidelity per MemoryQuery).
+        # The formatted output budget is separate from the embedding-input
+        # budget above; the original MemoryQuery remains full-fidelity.
         context = effective_budget.apply_to_text(context)
 
         # Track only memories that survived ranking, entry limits, and the
