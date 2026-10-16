@@ -92,7 +92,7 @@ proxy = [
     "openai>=2.14.0",             # OpenAI API format support
     # The server still uses the v1 low-level Server decorator API. Keep this
     # cap until the SDK 2.x port lands (GH #2658 / regression GH #2977).
-    "mcp>=1.28.1,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
+    "mcp>=1.30.0,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
     "magika>=0.6.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'", # ML detection needs ORT wheels
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
@@ -140,7 +140,7 @@ ml = [
     # the floor here prevents Kompress from silently falling back to
     # "unavailable" when a sibling install (e.g. `pip install
     # strands-agents`) drags huggingface-hub backwards.
-    "huggingface-hub>=1.5.0,<2.0",
+    "huggingface-hub>=1.5.0,<3.0",
 ]
 # Memory system (hierarchical memory with vector search).
 # Uses the pure-Python sqlite-vec backend by default (VectorBackend.AUTO ->
@@ -256,7 +256,7 @@ autogen = [
 ]
 # MCP server for Claude Code integration
 mcp = [
-    "mcp>=1.28.1,<2.0.0",
+    "mcp>=1.30.0,<2.0.0",
     "httpx>=0.24.0",
     "starlette>=0.27.0",
     "uvicorn>=0.23.0,<1.0",
