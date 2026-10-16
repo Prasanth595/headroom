@@ -859,8 +859,7 @@ def _create_onnx_session(
         raise KompressModelNotCached(model_id) from last_err
     detail = f": {last_err}" if last_err is not None else ""
     raise FileNotFoundError(
-        f"No loadable ONNX artifact in {model_id}; "
-        f"tried {_onnx_filename_candidates()}{detail}"
+        f"No loadable ONNX artifact in {model_id}; tried {_onnx_filename_candidates()}{detail}"
     ) from last_err
 
 
