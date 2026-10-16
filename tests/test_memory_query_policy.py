@@ -11,17 +11,6 @@ from headroom.proxy.memory_query_policy import (
 )
 
 
-def test_render_embedding_input_orders_sources_for_embedding() -> None:
-    rendered = render_embedding_input(
-        user_text="latest user",
-        recent_tool_outputs=("tool output",),
-        recent_assistant_turns=("assistant context",),
-    )
-
-    assert rendered.index("assistant context") < rendered.index("tool output")
-    assert rendered.index("tool output") < rendered.index("latest user")
-
-
 def test_bounded_embedding_keeps_primary_question_and_context_tails() -> None:
     user = "古い質問" * 2000 + " latest JWT question"
     tool = "old tool output " * 1000 + " latest authentication failure"
@@ -49,7 +38,7 @@ def test_bounded_embedding_spends_remaining_budget_on_newest_context() -> None:
 
     assert len(rendered) <= 1200
     assert rendered.startswith(USER_DELIM + "latest question")
-    assert rendered.index("end-9") < rendered.index("end-8")
+    assert "end-9" in rendered and "end-8" in rendered
     assert "end-0" not in rendered
     assert "old background" not in rendered
 

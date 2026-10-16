@@ -797,18 +797,6 @@ class MemoryHandler:
             )
             return None
 
-        # Bound the derived embedding input, not the MemoryQuery's raw sources.
-        # Prefer the user's question and recent context tails while keeping
-        # embedding work independent of the full tool-output size.
-        if query is not None:
-            query_text = query.to_embedding_input(max_chars=4096)
-        else:
-            query_text = self._extract_user_query(messages)
-        if not query_text:
-            logger.debug("Memory: No query text for context search")
-            return None
-        query_text = query_text[-4096:]
-
         # Compose the budget: explicit per-call wins; otherwise derive
         # from self.config so existing top_k/min_similarity callers see
         # no behaviour change.
@@ -822,6 +810,22 @@ class MemoryHandler:
         )
 
         try:
+            if query is not None:
+                from headroom.proxy.memory_query_policy import bounded_embedding_parts
+
+                parts = bounded_embedding_parts(
+                    user_text=query.user_text,
+                    recent_tool_outputs=query.recent_tool_outputs,
+                    recent_assistant_turns=query.recent_assistant_turns,
+                )
+                prepare = getattr(backend, "prepare_search_query", None)
+                query_text = await prepare(*parts) if prepare is not None else "".join(parts)
+            else:
+                query_text = self._extract_user_query(messages)[-4096:]
+            if not query_text:
+                logger.debug("Memory: No query text for context search")
+                return None
+
             # Search memories on the per-request resolved backend.
             results = await backend.search_memories(
                 query=query_text,

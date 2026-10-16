@@ -47,9 +47,10 @@ class MemoryQuery:
         """Render delimited embedding input, optionally within a character budget.
 
         By default, context is chronological and user text comes last.
-        With a budget, user text comes first, followed by newest tool outputs
-        and assistant turns. User text is capped (2048 characters); each
-        context source is capped (512 characters).
+        With a character budget, user text comes first and recent context is
+        selected newest-first, then rendered chronologically so a tokenizer
+        can retain its newest tail. Proxy lookups separately reserve space
+        for both sources inside the active local model's token window.
         """
         return render_embedding_input(
             user_text=self.user_text,

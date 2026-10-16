@@ -32,13 +32,29 @@ def render_embedding_input(
             parts.append(USER_DELIM + user_text)
         return "".join(parts)
 
+    return "".join(
+        bounded_embedding_parts(
+            user_text=user_text,
+            recent_tool_outputs=recent_tool_outputs,
+            recent_assistant_turns=recent_assistant_turns,
+            max_chars=max_chars,
+        )
+    )
+
+
+def bounded_embedding_parts(
+    *,
+    user_text: str,
+    recent_tool_outputs: tuple[str, ...],
+    recent_assistant_turns: tuple[str, ...],
+    max_chars: int = 4096,
+) -> tuple[str, str]:
+    """Keep question and context separate so a tokenizer can budget both."""
     remaining = max(0, max_chars)
-    if user_text:
-        user_chars = min(2048, remaining - len(USER_DELIM))
-        if user_chars > 0:
-            part = USER_DELIM + user_text[-user_chars:]
-            parts.append(part)
-            remaining -= len(part)
+    user_chars = min(2048, max(0, remaining - len(USER_DELIM)))
+    question = USER_DELIM + user_text[-user_chars:] if user_text and user_chars else ""
+    remaining -= len(question) + bool(question)
+    parts: list[str] = []
     for delimiter, sources in (
         (TOOL_DELIM, recent_tool_outputs),
         (ASSISTANT_DELIM, recent_assistant_turns),
@@ -52,7 +68,7 @@ def render_embedding_input(
             part = delimiter + source[-source_chars:]
             parts.append(part)
             remaining -= len(part)
-    return "".join(parts)
+    return question, "".join(reversed(parts))
 
 
 def extract_memory_query_sources(
