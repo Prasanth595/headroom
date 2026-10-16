@@ -90,6 +90,12 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "Keep defer_loading tools out of the Anthropic prefix-tracker lineage key "
         "(default on; 0 counts them again).",
     ),
+    Knob(
+        "HEADROOM_BUFFERED_UPSTREAM_STREAM",
+        "bool",
+        "Send buffered CCR requests upstream as stream:true and fold the reply "
+        "(default on; 0 sends stream:false).",
+    ),
 )
 
 _KNOBS_BY_ENV: dict[str, Knob] = {k.env: k for k in RUNTIME_ENV_KNOBS}
