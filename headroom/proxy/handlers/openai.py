@@ -3312,8 +3312,8 @@ class OpenAIHandlerMixin:
             )
 
         # O1 (2026-09-27 perf audit): the snapshot of the original
-        # conversation aliases the live list unless hooks or pipeline
-        # extensions are configured; those can mutate `messages` in place
+        # conversation aliases the live list unless hooks, pipeline extensions
+        # or turn hooks are configured; those can mutate `messages` in place
         # (pre_compress receives the live list), so then it is an
         # independently owned copy (see snapshot_original_messages).
         from headroom.proxy.helpers import snapshot_original_messages
