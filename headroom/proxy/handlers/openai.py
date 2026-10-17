@@ -1099,6 +1099,109 @@ def _ensure_chatgpt_responses_store_false(
     return False
 
 
+def _web_search_history_drop_enabled() -> bool:
+    from headroom.proxy import runtime_env
+
+    return (runtime_env.getenv("HEADROOM_WEB_SEARCH_HISTORY", "1") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _drop_undeclared_web_search_calls(
+    payload: dict[str, Any],
+    *,
+    request_id: str | None = None,
+) -> int:
+    """Drop hosted ``web_search_call`` items from a request that cannot search.
+
+    Workaround for an OpenAI backend behaviour, not a Headroom bug. Codex on a
+    custom model provider (how Headroom wraps it) compacts locally: it resends
+    the whole history to ``/v1/responses`` with ``tools: []``. When that
+    history holds a hosted ``web_search_call`` item, the ChatGPT backend
+    answers 200 and then the in-band error "response protection is
+    unavailable". Codex ignores in-band ``error`` events, reports "stream
+    closed before response.completed", retries, and runs the same compaction
+    before every later prompt, so the session never answers again. The same
+    body completes with the ``web_search_call`` items removed, or with a
+    web_search tool declared.
+
+    Only the search action (its query or URL) leaves the history; the results
+    were never in it, and the model's answer that followed is a separate
+    ``message`` item that stays. A tool counts as declared in top-level
+    ``tools`` or in a Codex ``additional_tools`` input item (Codex >= 0.149
+    sends tools that way), under any ``web_search*`` type spelling. A request
+    continuing ``previous_response_id`` is left alone: its declarations may
+    live server-side.
+
+    Mutates *payload* in place and returns the number of items dropped
+    (0 = untouched). Callers skip it for a bypass request
+    (``x-headroom-bypass: true``), which asked for its bytes untouched.
+    Disable with ``HEADROOM_WEB_SEARCH_HISTORY=0`` (a registered runtime-env
+    knob, so ``headroom wrap`` also pushes it to a reused proxy). Remove once
+    the backend accepts such a body.
+    """
+    items = payload.get("input")
+    if not isinstance(items, list) or payload.get("previous_response_id"):
+        return 0
+    if not any(isinstance(item, dict) and item.get("type") == "web_search_call" for item in items):
+        return 0
+    tools = payload.get("tools")
+    declared = list(tools) if isinstance(tools, list) else []
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            declared.extend(item["tools"] if isinstance(item.get("tools"), list) else [])
+    if any(
+        isinstance(tool, dict) and str(tool.get("type") or "").startswith("web_search")
+        for tool in declared
+    ):
+        return 0
+    if not _web_search_history_drop_enabled():
+        return 0
+    kept = [
+        item
+        for item in items
+        if not (isinstance(item, dict) and item.get("type") == "web_search_call")
+    ]
+    payload["input"] = kept
+    dropped = len(items) - len(kept)
+    logger.info(
+        "event=web_search_history request_id=%s dropped=%d reason=no_web_search_tool",
+        request_id or "-",
+        dropped,
+    )
+    return dropped
+
+
+def _drop_undeclared_web_search_calls_from_frame(
+    raw_msg: str,
+    *,
+    request_id: str | None = None,
+) -> str:
+    """Apply :func:`_drop_undeclared_web_search_calls` to a WS ``response.create`` frame.
+
+    Returns *raw_msg* unchanged (same object) unless items were dropped. The
+    substring prescreen keeps every frame without a ``web_search_call`` from
+    paying a parse. JSON can spell the type with ``\\uXXXX`` escapes
+    (``"web_search\\u005fcall"``), and a letter or underscore can only be
+    escaped that way, so a frame holding any ``\\u`` is parsed too.
+    """
+    if '"web_search_call"' not in raw_msg and "\\u" not in raw_msg:
+        return raw_msg
+    try:
+        frame = json.loads(raw_msg)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return raw_msg
+    if not isinstance(frame, dict) or frame.get("type") != "response.create":
+        return raw_msg
+    payload = frame["response"] if isinstance(frame.get("response"), dict) else frame
+    if not _drop_undeclared_web_search_calls(payload, request_id=request_id):
+        return raw_msg
+    return json.dumps(frame)
+
+
 _RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
     {
         "custom_tool_call_output",
@@ -5730,6 +5833,12 @@ class OpenAIHandlerMixin:
         # minimal `messages` list purely for downstream memory injection and
         # telemetry; list-typed `input` is consulted directly by the unit
         # extraction helpers.
+        #
+        # Before anything reads `input`: drop web_search_call history from a
+        # request that declares no web_search tool (Codex local compaction).
+        # A bypass request asked for its bytes untouched, so it is left alone.
+        if not _bypass and _drop_undeclared_web_search_calls(body, request_id=request_id):
+            body_mutation_tracker.mark_mutated("responses_web_search_history")
         input_data = body.get("input", "")
         instructions = body.get("instructions")
 
@@ -7632,6 +7741,14 @@ class OpenAIHandlerMixin:
                     model or "unknown",
                 )
 
+            # Resolved before the frame helpers below, which read it.
+            _ws_bypass = self._headroom_bypass_enabled(ws_headers)
+            if _ws_bypass:
+                logger.info(
+                    "[%s] WS /v1/responses passthrough reason=bypass_header mutation=disabled",
+                    request_id,
+                )
+
             def _normalize_ws_response_create_for_upstream(raw_msg: str) -> str:
                 """Optionally flatten Codex WS response.create frames for gateways.
 
@@ -7639,7 +7756,18 @@ class OpenAIHandlerMixin:
                 OpenAI-compatible gateways accept the WebSocket upgrade but expect
                 model/input/tools at the top level of response.create frames.
                 Preserve default upstream behavior unless explicitly enabled.
+
+                Every response.create frame headed upstream (first frame, which
+                the HTTP fallback also replays, later frames, memory
+                continuations) passes through here, so it also drops
+                web_search_call history the frame declares no tool for (see
+                ``_drop_undeclared_web_search_calls``), except on a bypass
+                session, whose frames stay as the client sent them.
                 """
+                if not _ws_bypass:
+                    raw_msg = _drop_undeclared_web_search_calls_from_frame(
+                        raw_msg, request_id=request_id
+                    )
                 if os.environ.get(
                     "HEADROOM_OPENAI_WS_FLATTEN_RESPONSE_CREATE", ""
                 ).strip().lower() not in (
