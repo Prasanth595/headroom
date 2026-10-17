@@ -54,13 +54,78 @@ HEADROOM_OPENCODE_MODELS: dict[str, Any] = {
 }
 
 
-def headroom_provider_entry(port: int) -> dict[str, Any]:
+# Env var holding comma-separated extra model specs (same format as the
+# `--extra-model` flag) so custom models survive re-wraps. Names in it cannot
+# contain a comma.
+HEADROOM_OPENCODE_EXTRA_MODELS_ENV = "HEADROOM_OPENCODE_EXTRA_MODELS"
+
+# Defaults for extra models when the spec omits limits. The output default is
+# also capped at the context window.
+_EXTRA_MODEL_DEFAULT_CONTEXT = 200000
+_EXTRA_MODEL_DEFAULT_OUTPUT = 16384
+
+
+def _extra_model_limit(raw: str, label: str, spec: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"extra model spec has a non-integer {label}: {spec!r}") from None
+    if value <= 0:
+        raise ValueError(f"extra model spec has a non-positive {label}: {spec!r}")
+    return value
+
+
+def parse_extra_model_spec(spec: str) -> tuple[str, dict[str, Any]]:
+    """Parse an ``id[=name[=context_window[=output_limit]]]`` extra-model spec.
+
+    Fields are split on ``=`` because model ids routinely contain ``:``
+    (Ollama ``qwen2.5-coder:7b``, OpenRouter ``vendor/model:free``).
+    Returns a ``(model_id, entry)`` pair shaped like the values in
+    ``HEADROOM_OPENCODE_MODELS``. ``name`` defaults to the id,
+    ``context_window`` to 200000 and ``output_limit`` to
+    ``min(16384, context_window)``. Raises ``ValueError`` on an empty id or a
+    non-integer or non-positive limit.
+    """
+    parts = [part.strip() for part in spec.split("=", 3)]
+    model_id = parts[0]
+    if not model_id:
+        raise ValueError(f"extra model spec has an empty model id: {spec!r}")
+    name = parts[1] if len(parts) > 1 and parts[1] else model_id
+    context = (
+        _extra_model_limit(parts[2], "context window", spec)
+        if len(parts) > 2 and parts[2]
+        else _EXTRA_MODEL_DEFAULT_CONTEXT
+    )
+    output = (
+        _extra_model_limit(parts[3], "output limit", spec)
+        if len(parts) > 3 and parts[3]
+        else min(_EXTRA_MODEL_DEFAULT_OUTPUT, context)
+    )
+    return model_id, {"name": name, "limit": {"context": context, "output": output}}
+
+
+def extra_models_from_env() -> dict[str, Any]:
+    """Parse extra models from ``HEADROOM_OPENCODE_EXTRA_MODELS`` (comma-separated)."""
+    raw = os.environ.get(HEADROOM_OPENCODE_EXTRA_MODELS_ENV, "")
+    models: dict[str, Any] = {}
+    for spec in raw.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        model_id, entry = parse_extra_model_spec(spec)
+        models[model_id] = entry
+    return models
+
+
+def headroom_provider_entry(
+    port: int, extra_models: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Return the `headroom` provider block pointed at the local proxy."""
     return {
         "npm": "@ai-sdk/openai-compatible",
         "name": "Headroom Proxy",
         "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
-        "models": HEADROOM_OPENCODE_MODELS,
+        "models": {**HEADROOM_OPENCODE_MODELS, **(extra_models or {})},
     }
 
 
@@ -226,7 +291,9 @@ def _inject_key_into_json(data: dict[str, Any], key: str, value: Any) -> dict[st
     return data
 
 
-def inject_opencode_provider_config(port: int, *, keep_user_entries: bool = False) -> None:
+def inject_opencode_provider_config(
+    port: int, extra_models: dict[str, Any] | None = None, *, keep_user_entries: bool = False
+) -> None:
     """Inject a Headroom model provider into OpenCode's config file.
 
     Safe to call multiple times — the injected block is replaced on each call,
@@ -259,7 +326,7 @@ def inject_opencode_provider_config(port: int, *, keep_user_entries: bool = Fals
             data = _parse_json_loose(content)
 
         # Merge provider into the JSON data structure.
-        entry = headroom_provider_entry(port)
+        entry = headroom_provider_entry(port, extra_models)
         # Keep the user's own model ids and options (an apiKey, say) under the
         # headroom provider: OpenCode only resolves `headroom/<id>` for listed
         # ids, so a third-party upstream needs them. Only when the caller named
@@ -272,7 +339,7 @@ def inject_opencode_provider_config(port: int, *, keep_user_entries: bool = Fals
             if isinstance(existing.get("options"), dict):
                 entry["options"] = {**existing["options"], **entry["options"]}
             if isinstance(existing.get("models"), dict):
-                entry["models"] = {**entry["models"], **existing["models"]}
+                entry["models"] = {**entry["models"], **existing["models"], **(extra_models or {})}
         provider = {"headroom": entry}
         data = _inject_key_into_json(data, "provider", provider)
 
