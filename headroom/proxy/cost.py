@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from headroom.cache_economics import CACHE_ECONOMICS as _CACHE_ECONOMICS
 from headroom.log_safety import WarnOnce, describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.proxy.budget_basis_policy import (
     BUDGET_BASIS_BLOCK,
     BUDGET_BASIS_IGNORE,
@@ -45,6 +46,7 @@ def _get_litellm_module() -> Any | None:
         return litellm
 
     try:
+        pin_litellm_cost_map_local()
         import litellm as imported_litellm
     except ImportError:
         return None

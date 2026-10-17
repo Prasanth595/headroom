@@ -25,6 +25,7 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom.log_safety import WarnOnce, describe_exception, safe_id
+from headroom.offline import pin_litellm_cost_map_local
 from headroom.proxy import project_name_policy
 from headroom.proxy.persistent_metrics import PersistentMetricsState
 
@@ -152,6 +153,7 @@ def _get_litellm_module() -> Any | None:
         return litellm
 
     try:
+        pin_litellm_cost_map_local()
         import litellm as imported_litellm
     except ImportError:
         return None
