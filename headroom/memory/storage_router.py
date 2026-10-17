@@ -248,9 +248,21 @@ class ProjectResolver:
         except (OSError, ValueError):
             normalised = cwd
         normalised = normalised.rstrip(os.sep) or os.sep
+        # A path with no UTF-8 form cannot be hashed without a lossy encoding
+        # that could merge distinct directories onto one store. It reaches
+        # here either from the input (an unpaired surrogate, e.g. a
+        # JSON-decoded ``\ud800`` escape) or from ``realpath`` following a
+        # symlink to a non-UTF-8 filename, which POSIX returns as
+        # ``\udcXX`` surrogate escapes. Check after normalising so both are
+        # covered, and treat the cwd as unusable: resolution falls through to
+        # the next tier, or fails closed, instead of raising (#4162).
+        try:
+            encoded = normalised.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
         basename = os.path.basename(normalised) or "root"
         safe_basename = cls._sanitize_basename(basename) or "project"
-        digest = hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256(encoded).hexdigest()[:16]
         key = f"{safe_basename}-{digest}"
         return key, basename
 

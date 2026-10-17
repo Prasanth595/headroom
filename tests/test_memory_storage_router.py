@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,77 @@ def test_resolver_returns_none_when_nothing_resolves() -> None:
     r = ProjectResolver()
     out = r.resolve(_ctx(system_prompt="A generic system prompt with no env block."))
     assert out is None
+
+
+def test_resolver_unencodable_system_prompt_cwd_does_not_raise() -> None:
+    # Issue #4162: a JSON-decoded ``\ud800`` escape leaves an unpaired
+    # surrogate in the cwd. It has no UTF-8 form, so it is not a usable
+    # identity: resolve to "no project" instead of raising.
+    r = ProjectResolver()
+    prompt = "Primary working directory: /work/" + chr(0xD800)
+    assert r.resolve(_ctx(system_prompt=prompt)) is None
+
+
+def test_resolver_unencodable_cli_override_falls_through_to_system_prompt() -> None:
+    # An unusable cwd in one tier must not block a usable one in a later tier.
+    r = ProjectResolver()
+    out = r.resolve(
+        _ctx(
+            project_root_override="/work/" + chr(0xDC80),
+            system_prompt="Primary working directory: /Users/foo/code/headroom\n",
+        )
+    )
+    assert out is not None
+    _, display = out
+    assert display == "headroom"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX undecodable byte filenames and symlinks only")
+def test_resolver_symlink_to_undecodable_name_does_not_raise(tmp_path: Path) -> None:
+    # The cwd itself is plain UTF-8, but realpath follows the symlink to a
+    # non-UTF-8 filename and returns it as a ``\udcXX`` surrogate escape.
+    # Creating that fixture is a filesystem capability, not product behavior:
+    # skip if it is unavailable (e.g. macOS APFS rejects non-UTF-8 names).
+    # test_resolver_realpath_returning_surrogate_does_not_raise covers the
+    # same path on every platform.
+    base = os.fsencode(tmp_path)
+    try:
+        os.mkdir(base + b"/\xff-target")
+        os.symlink(base + b"/\xff-target", base + b"/link")
+    except (OSError, UnicodeError) as exc:
+        pytest.skip(f"cannot create a non-UTF-8 symlink fixture here: {exc}")
+    prompt = f"Primary working directory: {tmp_path}/link\n"
+    assert ProjectResolver().resolve(_ctx(system_prompt=prompt)) is None
+
+
+def test_resolver_realpath_returning_surrogate_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same case as above on any OS: realpath yields what Linux returns for a
+    # symlink to a non-UTF-8 filename.
+    monkeypatch.setattr(os.path, "realpath", lambda _p: "/work/\udcff-target")
+    prompt = "Primary working directory: /work/link\n"
+    assert ProjectResolver().resolve(_ctx(system_prompt=prompt)) is None
+
+
+def test_resolver_valid_non_ascii_cwd_still_resolves() -> None:
+    r = ProjectResolver()
+    out = r.resolve(_ctx(system_prompt="Primary working directory: /Users/foo/code/café\n"))
+    assert out is not None
+    key, display = out
+    assert display == "café"
+    assert key.startswith("caf")
+
+
+def test_router_project_mode_unencodable_cwd_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router = _make_router(tmp_path, MemoryStorageMode.PROJECT, monkeypatch)
+    _, scope = router.backend_for(
+        _ctx(system_prompt="Primary working directory: /work/" + chr(0xD800))
+    )
+    assert scope.mode is MemoryStorageMode.PROJECT
+    assert scope.project_key is None
 
 
 def test_resolver_same_cwd_yields_stable_key_across_calls() -> None:
