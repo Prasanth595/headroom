@@ -148,6 +148,35 @@ headroom proxy --codex-wire-debug
 HEADROOM_COMPRESS_PASSTHROUGH=1 headroom proxy
 ```
 
+Automatic memory lookup renders a separate, bounded embedding query:
+
+| Input | Maximum characters |
+| --- | ---: |
+| Entire query, including delimiters | 4096 |
+| Latest user message tail | 2048 |
+| Each recent tool-output tail | 512 |
+| Each recent assistant-turn tail | 512 |
+
+These are source-size limits, not token estimates. The local ONNX and
+sentence-transformers embedders then use their actual tokenizer and configured
+input window, including special tokens. When both sources are present, they
+reserve room for the question and context separately; unused space can go to
+the other source. Newest tool evidence is at the end of the context so retaining
+its tail does not silently discard it behind a long question.
+
+Remote embedders that do not expose a local tokenizer retain the character
+limits; these do not guarantee an arbitrary remote model's token window.
+The raw `MemoryQuery` fields stay unchanged, and SDK callers that render without
+a budget still receive the full sources.
+
+Anthropic's pre-upstream lookup keeps its existing 2.0-second deadline,
+configured by `ProxyConfig.anthropic_pre_upstream_memory_context_timeout_seconds`.
+Bounding the input limits embedding work; it is not a guarantee against cold
+model initialization or a slow embedding server. Memory failures include the
+exception representation, so an otherwise empty timeout is identifiable as
+`TimeoutError()`.
+
+
 <Callout type="info" title="LLMLingua removed from the proxy CLI">
 The old LLMLingua proxy toggles are no longer part of the CLI. Headroom's proxy compression path uses ContentRouter plus the current built-in compressors, including Kompress where applicable.
 </Callout>

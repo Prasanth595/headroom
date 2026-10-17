@@ -3015,7 +3015,7 @@ class AnthropicHandlerMixin:
                                         query=user_query,
                                     )
                     except Exception as e:
-                        logger.warning(f"[{request_id}] Memory: Context injection failed: {e}")
+                        logger.warning(f"[{request_id}] Memory: Context injection failed: {e!r}")
 
                 # Inject memory tools — PR-A7 (P0-6) routes through
                 # `apply_session_sticky_memory_tools` so tool list bytes

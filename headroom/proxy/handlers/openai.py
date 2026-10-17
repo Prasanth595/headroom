@@ -4266,7 +4266,7 @@ class OpenAIHandlerMixin:
                     memory_tools_injected = True
                     logger.info(f"[{request_id}] Memory: Injected memory tools (openai)")
             except Exception as e:
-                logger.warning(f"[{request_id}] Memory injection failed: {e}")
+                logger.warning(f"[{request_id}] Memory injection failed: {e!r}")
 
         if memory_context_injected or memory_tools_injected:
             remembered_event = self.pipeline_extensions.emit(
@@ -6152,7 +6152,7 @@ class OpenAIHandlerMixin:
                             f"[{request_id}] Memory: Injected memory tools (openai/responses)"
                         )
             except Exception as e:
-                logger.warning(f"[{request_id}] Memory injection failed (responses): {e}")
+                logger.warning(f"[{request_id}] Memory injection failed (responses): {e!r}")
         elif self.memory_handler and memory_user_id and _bypass:
             logger.info(
                 "[%s] Responses memory passthrough reason=bypass_header",
@@ -8175,7 +8175,7 @@ class OpenAIHandlerMixin:
 
                     return json.dumps(frame_body)
                 except Exception as e:
-                    logger.warning(f"[{request_id}] WS Memory injection failed: {e}")
+                    logger.warning(f"[{request_id}] WS Memory injection failed: {e!r}")
                     return frame_raw
 
             if first_frame_is_create:
