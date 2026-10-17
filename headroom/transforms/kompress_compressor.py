@@ -91,6 +91,44 @@ KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
 KOMPRESS_ONNX_FILENAME_ENV = "HEADROOM_KOMPRESS_ONNX_FILENAME"
 
 
+# Tokens the model reads per chunk; the tokenizer truncates each chunk here.
+_KOMPRESS_MAX_TOKENS = 512
+
+
+def _row_token_counts(word_id_rows: list[list[int | None]]) -> list[int]:
+    """Real tokens per row of a padded batch, from the word ids alone.
+
+    Padding and special tokens both map to no word, so a row's trailing run
+    of ``None`` is its padding plus the special tokens every row ends with.
+    The longest row has no padding, so its run is the shortest. Read from
+    the word ids rather than ``attention_mask`` so the count does not depend
+    on the tensor type (numpy for ONNX, torch for CUDA and MPS).
+    """
+    trailing = []
+    for row in word_id_rows:
+        n = 0
+        while n < len(row) and row[-1 - n] is None:
+            n += 1
+        trailing.append(n)
+    specials = min(trailing, default=0)
+    return [len(row) - (n - specials) for row, n in zip(word_id_rows, trailing)]
+
+
+def _words_seen_whole(word_ids: list[int | None], n_tokens: int, n_words: int) -> int:
+    """Count the leading words of a chunk the model saw in full.
+
+    ``word_ids`` maps each token to its word. Truncation can stop inside a
+    word, so once the chunk was cut (words are missing, or the token cap was
+    hit) the last word present may be a prefix and is not counted.
+    """
+    seen = [wid for wid in word_ids if wid is not None]
+    if not seen:
+        return 0
+    last = max(seen)
+    cut = last + 1 < n_words or n_tokens >= _KOMPRESS_MAX_TOKENS
+    return last if cut else last + 1
+
+
 def _add_kompress_must_keep_words(
     kept_ids: set[int],
     chunk_words: list[str],
@@ -1956,7 +1994,13 @@ class KompressCompressor(Transform):
             budget = _capped_time_budget(_time_budget_cap_seconds)
             deadline = time.monotonic() + budget if budget is not None else None
 
-            for chunk_start in range(0, n_words, max_chunk_words):
+            # The model sees at most 512 tokens per chunk. A 350-word chunk of
+            # URLs, code or citation markers tokenizes past that, and a word
+            # beyond the cut gets no keep decision at all. Advance by the words
+            # the tokenizer kept whole, so the rest start the next chunk and
+            # every word is scored or kept.
+            chunk_start = 0
+            while chunk_start < n_words:
                 remaining: float | None = None
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -1992,7 +2036,7 @@ class KompressCompressor(Transform):
                     chunk_words,
                     is_split_into_words=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=_KOMPRESS_MAX_TOKENS,
                     padding=True,
                     return_tensors=return_tensors,
                 )
@@ -2000,6 +2044,14 @@ class KompressCompressor(Transform):
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
                 word_ids = encoding.word_ids(batch_index=0)
+                # One row, so no padding: every token in it is real.
+                scored = _words_seen_whole(word_ids, len(word_ids), len(chunk_words))
+                if scored == 0:
+                    # One word fills the window by itself (a long URL or a
+                    # minified line). The model cannot see it whole: keep it.
+                    kept_ids.add(chunk_start)
+                    chunk_start += 1
+                    continue
 
                 if not is_onnx:
                     device = next(model.parameters()).device
@@ -2067,10 +2119,12 @@ class KompressCompressor(Transform):
                             mask_list = keep_mask[0].cpu()
                     inference_ms += (time.perf_counter() - inference_started) * 1000
 
+                # A word past `scored` is a prefix the cut left behind: it is
+                # rescored with the next chunk and must not take a slot here.
                 if target_ratio is not None:
                     word_scores: dict[int, float] = {}
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         s = float(score_list[idx])
                         if wid not in word_scores or s > word_scores[wid]:
@@ -2084,7 +2138,7 @@ class KompressCompressor(Transform):
                             kept_ids.add(wid + chunk_start)
                 else:
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
@@ -2092,7 +2146,8 @@ class KompressCompressor(Transform):
                 # Hard override: always keep must-keep tokens regardless of model score.
                 # Numbers, error names, paths, and flags carry meaning agents cannot
                 # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.
-                _add_kompress_must_keep_words(kept_ids, chunk_words, chunk_start)
+                _add_kompress_must_keep_words(kept_ids, chunk_words[:scored], chunk_start)
+                chunk_start += scored
 
             for i, line_id in enumerate(line_ids):
                 if line_id in protected_line_ids:
@@ -2426,13 +2481,15 @@ class KompressCompressor(Transform):
                     batch_word_lists,
                     is_split_into_words=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=_KOMPRESS_MAX_TOKENS,
                     padding=True,
                     return_tensors=return_tensors,
                 )
 
                 input_ids = encoding["input_ids"]
                 attention_mask = encoding["attention_mask"]
+                word_id_rows = [encoding.word_ids(batch_index=i) for i in range(len(batch))]
+                row_tokens = _row_token_counts(word_id_rows)
 
                 if not is_onnx:
                     device = next(model.parameters()).device
@@ -2480,13 +2537,24 @@ class KompressCompressor(Transform):
                     inference_ms += (time.perf_counter() - inference_started) * 1000
 
                 for batch_idx, (text_idx, chunk_start, chunk_words, ratio) in enumerate(batch):
-                    word_ids = encoding.word_ids(batch_index=batch_idx)
+                    word_ids = word_id_rows[batch_idx]
                     score_list = scores[batch_idx] if is_onnx else scores[batch_idx].cpu()
 
-                    # Token -> word reduction (max score per word).
+                    # Words past the 512-token cut, and the word the cut may
+                    # have split, were never scored whole. The batch is built
+                    # before tokenizing, so instead of re-chunking (the single
+                    # path does) keep them: an unscored word is not a word the
+                    # model chose to drop.
+                    scored = _words_seen_whole(word_ids, row_tokens[batch_idx], len(chunk_words))
+                    kept_ids_per_text[text_idx].update(
+                        range(chunk_start + scored, chunk_start + len(chunk_words))
+                    )
+
+                    # Token -> word reduction (max score per word). Words from
+                    # `scored` on are kept above and must not take a slot here.
                     word_scores: dict[int, float] = {}
                     for idx, wid in enumerate(word_ids):
-                        if wid is None:
+                        if wid is None or wid >= scored:
                             continue
                         s = float(score_list[idx])
                         if wid not in word_scores or s > word_scores[wid]:
