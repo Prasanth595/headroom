@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
+from headroom.providers.codex import proxy_base_url
+from headroom.proxy.project_context import with_project_prefix
+
 DEFAULT_API_URL = "https://api.x.ai"
 PROXY_ENV_KEY = "GROK_MODELS_BASE_URL"
 
@@ -49,11 +52,6 @@ def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
     return any(token.startswith(_GROK_UA_PREFIXES) for token in user_agent.lower().split())
 
 
-def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL used by Grok CLI integrations."""
-    return f"http://127.0.0.1:{port}/v1"
-
-
 def build_launch_env(
     port: int,
     environ: Mapping[str, str] | None = None,
@@ -69,7 +67,6 @@ def build_launch_env(
     base-URL prefix because Grok cannot send custom attribution headers;
     the proxy strips it and attributes savings per project.
     """
-    from headroom.proxy.project_context import with_project_prefix
 
     env = dict(environ or os.environ)
     base_url = with_project_prefix(proxy_base_url(port), project)

@@ -26,7 +26,31 @@ name to :data:`TOOL_SCHEMA_SAVINGS_TAGS` and every surface picks it up.
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any
+
+from headroom.log_safety import WarnOnce, describe_exception
+
+logger = logging.getLogger(__name__)
+
+# A failure that repeats on every request warns once per exception type; every
+# occurrence also goes to debug.
+_reconcile_warned = WarnOnce(32, "tool-schema reconcile failure types")
+
+
+def _log_reconcile_failure(exc: Exception, booked: int) -> None:
+    # The exception comes from tokenizing client tool schemas and can quote
+    # them, so it is described by type and code location only, at every level.
+    where = describe_exception(exc)
+    if _reconcile_warned.first(type(exc).__qualname__, logger):
+        logger.warning(
+            "tool-schema deferral reconcile failed (%s); credit left at %d booked tokens, "
+            "so /stats over-reports tool-search savings for this request. Please report "
+            "this as a bug.",
+            where,
+            booked,
+        )
+    logger.debug("tool-schema deferral reconcile failed; booked=%d: %s", booked, where)
 
 
 def without_deferral_flags(tools: object) -> object:
@@ -128,7 +152,8 @@ def reconcile_deferred_tokens(
         tags["tool_search_deferred_tools"] = len(kept)
         if isinstance(entry, dict):
             entry["tokens"] = max(0, int(entry.get("tokens") or 0) - released)
-    except Exception:  # accounting must never break a request
+    except Exception as exc:  # accounting must never break a request
+        _log_reconcile_failure(exc, booked)
         return
 
 
@@ -156,6 +181,26 @@ def tool_schema_saved_from_tags(tags: object) -> int:
         except (TypeError, ValueError):
             continue
     return total
+
+
+def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> int:
+    """Net a request's message-side saving against the tool saving its turn
+    hooks booked on ``turn_hook_tools_saved_tokens``; return it clamped at 0.
+
+    The headline is ``tokens_saved`` (clamped) plus that tag. A hook that adds
+    message text while removing tools leaves ``raw_saved`` negative, and the
+    clamp alone would drop the growth while the tag kept the full removal. The
+    deficit is debited from the tag first (at most what the hooks booked on
+    this request), so headline == messages + tools, signed, clamped once.
+    """
+    raw = int(raw_saved)
+    booked = max(0, int(hook_tool_saved or 0))
+    if raw < 0 and booked > 0 and isinstance(tags, dict):
+        offset = min(-raw, booked)
+        current = int(tags.get("turn_hook_tools_saved_tokens", 0) or 0)
+        tags["turn_hook_tools_saved_tokens"] = max(0, current - offset)
+        raw += offset
+    return max(0, raw)
 
 
 def headline_tokens_saved(tokens_saved: object, tags: object) -> int:
