@@ -284,6 +284,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **code:** fix two `CodeAwareCompressor` AST-reassembly bugs: an exported JS/TS function or class (`export function foo() {`) produced a duplicated `export export` keyword and invalid syntax, because line-based node slicing (used to preserve indentation) pulled in the preceding `export` sibling's text on top of the `export_statement` handler's own prefix reconstruction. Separately, in every supported language, a doc comment immediately above a top-level function, class, or type was detached from its declaration during extraction and re-emitted in a cluster at the end of the compressed output instead of staying attached to what it documents.
 - * **proxy:** Buffered upstream responses containing a `server_tool_use` (or any other unrecognized Anthropic content block) no longer turn a fully-generated response into an HTTP 502. `StreamingMixin._response_to_sse` raised `ValueError` on unknown block types after the entire upstream generation had already been buffered, so a slow-but-successful response failed and the client retried the whole multi-minute request. Unknown blocks are now emitted verbatim in `content_block_start` (following the existing redacted_thinking` pattern), so `server_tool_use`, `server_tool_result`, `mcp_tool_use`, and future block types round-trip ([#1806](https://github.com/headroomlabs-ai/headroom/issues/1806)).
 
+## [0.42.0](https://github.com/headroomlabs-ai/headroom/compare/v0.41.0...v0.42.0) (2026-10-17)
+
+
+### Features
+
+* **pipeline:** put per-request saved tokens on OutcomeSnapshot ([#4231](https://github.com/headroomlabs-ai/headroom/issues/4231)) ([8cedf7b](https://github.com/headroomlabs-ai/headroom/commit/8cedf7be4decfb3a0da42e4e955b6a3301a66dc9))
+* **proxy:** let turn hooks rewrite OpenAI Responses requests on HTTP and WebSocket ([#4232](https://github.com/headroomlabs-ai/headroom/issues/4232)) ([fbf7bc3](https://github.com/headroomlabs-ai/headroom/commit/fbf7bc3278c11975299b9bd0a2ecf200dfd25a05))
+* **savings:** add the per-request counterfactual savings record ([#4236](https://github.com/headroomlabs-ai/headroom/issues/4236)) ([2912b7b](https://github.com/headroomlabs-ai/headroom/commit/2912b7b620d7abd39828db73e4f326b9a041d309))
+
+
+### Bug Fixes
+
+* **batch:** preserve live contexts during capacity cleanup ([#4210](https://github.com/headroomlabs-ai/headroom/issues/4210)) ([2cbdd22](https://github.com/headroomlabs-ai/headroom/commit/2cbdd22a65789676d9ebbd9e2b6a908e7f8fad95))
+* **batch:** preserve native Gemini continuation tools ([#4211](https://github.com/headroomlabs-ai/headroom/issues/4211)) ([8757458](https://github.com/headroomlabs-ai/headroom/commit/875745889ff065208d3a32aa583881468ae7c41d))
+* **ccr:** stream the buffered CCR upstream request so idle-killing networks cannot cut it ([#4206](https://github.com/headroomlabs-ai/headroom/issues/4206)) ([ca6ba34](https://github.com/headroomlabs-ai/headroom/commit/ca6ba3486c09badecb1bfe99ddabf562c9f01c77))
+* **deps:** bump rustls to 0.23.46 for RUSTSEC-2026-0346..0349 ([#4222](https://github.com/headroomlabs-ai/headroom/issues/4222)) ([132dbc7](https://github.com/headroomlabs-ai/headroom/commit/132dbc76995cdbecc25b4f647dbf919351cd5f7f))
+* **deps:** require hf-xet&gt;=1.6.0 so a Hub download can't crash Python at exit ([#4192](https://github.com/headroomlabs-ai/headroom/issues/4192)) ([9e5dac7](https://github.com/headroomlabs-ai/headroom/commit/9e5dac7c74979abd8d1b9ad9615443b76e42b530))
+* **deps:** require mcp&gt;=1.30.0 for CVE-2026-59951 ([#4239](https://github.com/headroomlabs-ai/headroom/issues/4239)) ([2f7a83a](https://github.com/headroomlabs-ai/headroom/commit/2f7a83a91d3ca33a79b5c41b8095f6454b5bfb43))
+* **kompress:** skip the local model download when a remote endpoint is set ([#4234](https://github.com/headroomlabs-ai/headroom/issues/4234)) ([ff36931](https://github.com/headroomlabs-ai/headroom/commit/ff3693165344410eaf2882209648e504f9d3eaf0))
+* **kompress:** time each model-load stage and stop false not-ready warnings during warm-up ([#4195](https://github.com/headroomlabs-ai/headroom/issues/4195)) ([89b229c](https://github.com/headroomlabs-ai/headroom/commit/89b229ce5feaeb8710f4e226a47697426231ca55))
+* **memory:** log storage and SQLite failures that currently make retrieval miss silently ([#4111](https://github.com/headroomlabs-ai/headroom/issues/4111)) ([4e6e955](https://github.com/headroomlabs-ai/headroom/commit/4e6e955cad0bff318e30bd4f24e934a23f57e9c6))
+* **openai:** read Responses cache_write_tokens instead of inferring writes ([#4237](https://github.com/headroomlabs-ai/headroom/issues/4237)) ([4630602](https://github.com/headroomlabs-ai/headroom/commit/46306024e74b3a44aca17fb70c1416f96b2a0b53))
+* **pricing:** suppress litellm's Provider List banner that corrupts perf JSON ([#4197](https://github.com/headroomlabs-ai/headroom/issues/4197)) ([e01ad35](https://github.com/headroomlabs-ai/headroom/commit/e01ad350dc71d44f1a4e07df5ea4e45fa39a4773))
+* **proxy:** judge NAT64 upstream addresses by their embedded IPv4 ([#4179](https://github.com/headroomlabs-ai/headroom/issues/4179)) ([486afaa](https://github.com/headroomlabs-ai/headroom/commit/486afaac7426fa1d6735fe2ce6ae37630d9d11ae))
+* **proxy:** let HEADROOM_LOG_LEVEL=debug turn on Headroom's own debug logs ([#4137](https://github.com/headroomlabs-ai/headroom/issues/4137)) ([00093ce](https://github.com/headroomlabs-ai/headroom/commit/00093ceddcf42c3936a96ea5f280af2d0e1b2e47))
+* **proxy:** make handler failures debuggable from the logs ([#4127](https://github.com/headroomlabs-ai/headroom/issues/4127)) ([7dc20b6](https://github.com/headroomlabs-ai/headroom/commit/7dc20b6fe027cf262c5e2d0415f0dbb2032ac73b))
+* **proxy:** net tools a turn hook adds against the saving it books ([#4057](https://github.com/headroomlabs-ai/headroom/issues/4057)) ([85520c2](https://github.com/headroomlabs-ai/headroom/commit/85520c2941ed6b2c4cd4bfd9f747b24227a256aa))
+* **proxy:** report disabled Kompress at startup ([#4217](https://github.com/headroomlabs-ai/headroom/issues/4217)) ([430ea4f](https://github.com/headroomlabs-ai/headroom/commit/430ea4f4ebaeb0b217e237084963b64775bef24a))
+* **proxy:** report read maturation as inert in cache mode ([#4198](https://github.com/headroomlabs-ai/headroom/issues/4198)) ([ba82453](https://github.com/headroomlabs-ai/headroom/commit/ba824539d6f80c3e056f299789c1cf079a4693fe))
+* **proxy:** show turn-hook savings in /stats extension_savings, incl. Codex WS ([#4233](https://github.com/headroomlabs-ai/headroom/issues/4233)) ([1d112cd](https://github.com/headroomlabs-ai/headroom/commit/1d112cd36c9aee765ec3b550773de0c93c6d79be))
+* **proxy:** snapshot the original messages when a turn hook can edit them ([#4241](https://github.com/headroomlabs-ai/headroom/issues/4241)) ([df11f27](https://github.com/headroomlabs-ai/headroom/commit/df11f2749862a0090db11f7fca3e7dc42a75b612))
+* **telemetry:** let HEADROOM_TELEMETRY=off stop the anonymous beacon ([#4235](https://github.com/headroomlabs-ai/headroom/issues/4235)) ([1a40b3c](https://github.com/headroomlabs-ai/headroom/commit/1a40b3ce67ad9e155ba768e8d05cec4c872c7f99))
+* **transforms:** log the compression failures that silently become "no savings" ([#4092](https://github.com/headroomlabs-ai/headroom/issues/4092)) ([580cc83](https://github.com/headroomlabs-ai/headroom/commit/580cc83a9a412123040978447a2c9b77c08670b0))
+
+
+### Dependencies
+
+* Bump base64 from 0.22.1 to 0.23.1 ([#4029](https://github.com/headroomlabs-ai/headroom/issues/4029)) ([8d468d4](https://github.com/headroomlabs-ai/headroom/commit/8d468d455c2e3c195cc2975bbc13e63d6b85ef59))
+* Bump ruff from 0.16.8 to 0.17.0 in the pip-minor-patch group across 1 directory ([#4026](https://github.com/headroomlabs-ai/headroom/issues/4026)) ([de3f639](https://github.com/headroomlabs-ai/headroom/commit/de3f639803f1f172f65c05c165bfab92c0bec9e8))
+* Bump the cargo-minor-patch group across 1 directory with 12 updates ([#4186](https://github.com/headroomlabs-ai/headroom/issues/4186)) ([683c9a6](https://github.com/headroomlabs-ai/headroom/commit/683c9a6120c309e84e4848378dbe3891d064f82e))
+* Bump the npm-minor-patch group across 2 directories with 16 updates ([#4218](https://github.com/headroomlabs-ai/headroom/issues/4218)) ([07c8bbf](https://github.com/headroomlabs-ai/headroom/commit/07c8bbf1edcc143a7fe97b9e29214355cc371a19))
+* Bump the npm-minor-patch group across 3 directories with 12 updates ([#4219](https://github.com/headroomlabs-ai/headroom/issues/4219)) ([1f71cb3](https://github.com/headroomlabs-ai/headroom/commit/1f71cb3d64e1586c97331a3482aae84558741102))
+* Update huggingface-hub requirement from &lt;2.0,&gt;=1.5.0 to &gt;=1.5.0,&lt;3.0 ([#4027](https://github.com/headroomlabs-ai/headroom/issues/4027)) ([fcf3db8](https://github.com/headroomlabs-ai/headroom/commit/fcf3db8e70d15aef0d80a561cf5d0e45e918a338))
+
+
+### Code Refactoring
+
+* **integrations:** share the local/cloud compress backend of asgi and litellm_callback ([#4124](https://github.com/headroomlabs-ai/headroom/issues/4124)) ([58caafb](https://github.com/headroomlabs-ai/headroom/commit/58caafb59b40c00b35ceee6237ef2289df71f25d))
+* **transforms:** share one CCR persist helper for the Rust-backed compressors ([#4094](https://github.com/headroomlabs-ai/headroom/issues/4094)) ([ea947ca](https://github.com/headroomlabs-ai/headroom/commit/ea947ca421ee6d6b8f15a9ed522c3a3bea5a3225))
+
 ## [0.41.0](https://github.com/headroomlabs-ai/headroom/compare/v0.40.0...v0.41.0) (2026-10-13)
 
 
