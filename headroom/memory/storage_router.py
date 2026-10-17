@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Known prefixes that mark a working-directory line inside a client's
 # ``<env>`` / ``<environment>`` system-prompt block. Ordered so that the
 # most specific / most recent client format is tried first. Matched with
-# literal ``str.find`` — no regex.
+# literal line-start checks after trimming — no regex.
 _CWD_PREFIXES: tuple[str, ...] = (
     "Primary working directory:",  # Claude Code (current)
     "Working directory:",  # Claude Code (older) / Codex
@@ -211,15 +211,15 @@ class ProjectResolver:
         if not system_prompt:
             return None
         for prefix in _CWD_PREFIXES:
-            idx = system_prompt.find(prefix)
-            if idx < 0:
-                continue
-            start = idx + len(prefix)
-            end = system_prompt.find("\n", start)
-            chunk = system_prompt[start:] if end < 0 else system_prompt[start:end]
-            chunk = chunk.strip()
-            if chunk:
-                return chunk
+            for raw_line in system_prompt.split("\n"):
+                line = raw_line.strip()
+                if line.startswith("-"):
+                    line = line[1:].lstrip()
+                if not line.startswith(prefix):
+                    continue
+                chunk = line[len(prefix) :].strip()
+                if chunk:
+                    return chunk
         return None
 
     @classmethod
@@ -481,7 +481,7 @@ def _first_user_text_with_cwd(messages: list[Any]) -> str:
             continue
         content = msg.get("content")
         user_text = content if isinstance(content, str) else _text_from_blocks(content)
-        if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
+        if user_text and ProjectResolver._extract_cwd_from_system_prompt(user_text) is not None:
             return user_text
     return ""
 
@@ -520,7 +520,7 @@ def extract_system_prompt(body: Mapping[str, Any]) -> str:
         # redirect this request at another project's memory store by pasting
         # its own ``cwd:`` line.
         trusted = "\n".join(parts)
-        if not any(prefix in trusted for prefix in _CWD_PREFIXES):
+        if ProjectResolver._extract_cwd_from_system_prompt(trusted) is None:
             cwd_text = _first_user_text_with_cwd(messages)
             if cwd_text:
                 parts.append(cwd_text)

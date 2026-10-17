@@ -145,6 +145,41 @@ def test_resolver_tier4_env_block_cwd_format() -> None:
     assert display == "cwd-style"
 
 
+def test_resolver_tier4_env_block_bulleted_cwd_format() -> None:
+    r = ProjectResolver()
+    prompt = "- cwd: /Users/foo/code/bulleted-cwd\n"
+    out = r.resolve(_ctx(system_prompt=prompt))
+    assert out is not None
+    _, display = out
+    assert display == "bulleted-cwd"
+
+
+def test_extract_cwd_prefers_primary_working_directory_over_earlier_cwd() -> None:
+    prompt = "cwd: /work/old\nPrimary working directory: /work/current\n"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(prompt) == "/work/current"
+
+
+def test_extract_cwd_preserves_vertical_tab_inside_path() -> None:
+    cwd = "/work/a\vpart"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(f"cwd: {cwd}\n") == cwd
+
+
+def test_extract_cwd_supports_crlf_line_endings() -> None:
+    prompt = "cwd: /work/current\r\n"
+
+    assert ProjectResolver._extract_cwd_from_system_prompt(prompt) == "/work/current"
+
+
+def test_resolver_ignores_incidental_cwd_prose() -> None:
+    r = ProjectResolver()
+    assert (
+        r.resolve(_ctx(system_prompt="When describing cwd: use the actual environment path."))
+        is None
+    )
+
+
 def test_resolver_returns_none_when_nothing_resolves() -> None:
     r = ProjectResolver()
     out = r.resolve(_ctx(system_prompt="A generic system prompt with no env block."))
@@ -252,6 +287,26 @@ def test_extract_system_prompt_system_message_beats_user_cwd_fallback() -> None:
     assert resolved is not None
     _, display = resolved
     assert display == "project"
+
+
+def test_extract_system_prompt_ignores_incidental_cwd_prose_for_fallback() -> None:
+    body = {
+        "system": "When describing cwd: use the actual environment path.",
+        "messages": [
+            {
+                "role": "user",
+                "content": "<env>\nPrimary working directory: /work/project-alpha\n</env>",
+            }
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert "Primary working directory: /work/project-alpha" in prompt
+    assert resolved is not None
+    _, display = resolved
+    assert display == "project-alpha"
 
 
 def test_extract_system_prompt_cwd_in_non_user_message_returns_empty() -> None:
