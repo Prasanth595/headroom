@@ -67,6 +67,7 @@ def build_launch_env(
     base-URL prefix because Grok cannot send custom attribution headers;
     the proxy strips it and attributes savings per project.
     """
+
     env = dict(environ or os.environ)
     base_url = with_project_prefix(proxy_base_url(port), project)
     env[PROXY_ENV_KEY] = base_url

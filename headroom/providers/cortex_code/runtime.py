@@ -42,6 +42,7 @@ def build_launch_env(
     *environ* with ``OPENAI_BASE_URL`` set to the local proxy endpoint.
     ``printed_lines`` is the ``KEY=VALUE`` form shown to the user on launch.
     """
+
     env = dict(environ or os.environ)
     base_url = with_project_prefix(proxy_base_url(port), project)
     env["OPENAI_BASE_URL"] = base_url

@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from headroom.providers._setup_text import project_attribution_lines
 from headroom.providers.codex import proxy_base_url
 from headroom.providers.grok.runtime import DEFAULT_API_URL
-from headroom.proxy.project_context import with_project_prefix
 
 
 @dataclass(frozen=True)
@@ -24,6 +23,8 @@ def build_proxy_targets(port: int, project: str | None = None) -> GrokBuildProxy
     base-URL prefix because Grok cannot send custom headers; the proxy
     strips it and attributes savings per project.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     return GrokBuildProxyTarget(
         base_url=with_project_prefix(proxy_base_url(port), project),
     )
