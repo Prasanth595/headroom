@@ -28,3 +28,9 @@ def test_build_launch_env_inherits_base_environ() -> None:
     env, _ = build_launch_env(9000, {"EXISTING_KEY": "existing-value"})
 
     assert env["EXISTING_KEY"] == "existing-value"
+
+
+def test_build_launch_env_empty_mapping_does_not_inherit_host(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_TEST_HOST_ONLY", "1")
+    env, _ = build_launch_env(9000, {})
+    assert "HEADROOM_TEST_HOST_ONLY" not in env

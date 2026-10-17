@@ -31,7 +31,7 @@ def build_launch_env(
     port: int, environ: Mapping[str, str] | None = None
 ) -> tuple[dict[str, str], list[str]]:
     """Build the environment used to route the Hermes CLI through Headroom."""
-    env = dict(environ or os.environ)
+    env = dict(environ if environ is not None else os.environ)
     openai_base_url = codex_proxy_base_url(port)
     anthropic_base_url = claude_proxy_base_url(port)
     env["OPENAI_BASE_URL"] = openai_base_url
