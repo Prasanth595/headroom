@@ -18,7 +18,7 @@ import ssl
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
@@ -740,6 +740,35 @@ def _openai_responses_result_with_cache_hit(result: Any) -> Any:
     if router_result is None:
         return result
     return replace(result, router_result=replace(router_result, cache_hit=True))
+
+
+def _openai_responses_cached_ccr_markers_live(result: Any) -> bool:
+    """Return whether CCR markers generated for a cached unit are still retrievable.
+
+    The unit-result cache outlives CCR entries: it has no TTL, while a CCR entry
+    expires after the CCR TTL and is written only when the unit is compressed.
+    Treat an expired generated entry as a miss so compression stores it again.
+    Inherited markers cannot be restored by recompressing the unit. A store that
+    cannot be consulted keeps the previous behaviour (reuse).
+    """
+    compressed = getattr(result, "compressed", None)
+    if not isinstance(compressed, str):
+        return True
+    hashes = Counter(match.group(1).lower() for match in _CCR_HASH_RE.finditer(compressed))
+    original = getattr(result, "original", "")
+    if isinstance(original, str):
+        # Inherited markers are preserved byte-for-byte; extra occurrences are generated.
+        hashes -= Counter(match.group(1).lower() for match in _CCR_HASH_RE.finditer(original))
+    if not hashes:
+        return True
+    try:
+        from headroom.cache.compression_store import get_compression_store
+
+        store = get_compression_store()
+        return all(store.exists(hash_key) for hash_key in hashes)
+    except Exception:
+        logger.debug("CCR liveness check for a cached Responses unit failed")
+        return True
 
 
 def _codex_ws_text_shape(text: str) -> str:
@@ -1811,6 +1840,11 @@ class OpenAIHandlerMixin:
             if result is None:
                 return None
             cache.move_to_end(key)
+        if not _openai_responses_cached_ccr_markers_live(result):
+            with lock:
+                if cache.get(key) is result:
+                    del cache[key]
+            return None
         return _openai_responses_result_with_cache_hit(result)
 
     def _store_openai_responses_cached_unit(self, key: str, result: Any) -> None:
