@@ -64,6 +64,8 @@ def test_antigravity_setup_lines_do_not_claim_ide_provider_settings() -> None:
     assert "mcp install --agent antigravity" in joined
     assert "/v1internal:streamGenerateContent" in joined
     assert "GOOGLE_GEMINI_BASE_URL" in joined
+    assert "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787" in joined
+    assert "For OpenAI-speaking clients" in joined
 
 
 def test_antigravity_render_setup_lines_project_attribution() -> None:

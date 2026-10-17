@@ -35,6 +35,9 @@ def build_proxy_targets(port: int, project: str | None = None) -> AntigravityPro
 def render_setup_lines(port: int, project: str | None = None) -> list[str]:
     """Render the Antigravity setup instructions for the local proxy."""
     targets = build_proxy_targets(port, project)
+    # The Gemini-compatible base URL (scheme://host; Gemini clients append
+    # /v1beta/...) — the one agy expects for GOOGLE_GEMINI_BASE_URL.
+    gemini_base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
     lines = [
         "  Headroom proxy is running. Antigravity setup:",
         "",
@@ -49,8 +52,13 @@ def render_setup_lines(port: int, project: str | None = None) -> list[str]:
         "    upstream like any other Cloud Code request.",
         "",
         "  The Antigravity CLI (agy), unlike the IDE, accepts a custom",
-        "  endpoint via its GOOGLE_GEMINI_BASE_URL setting. The proxy's",
-        "  OpenAI-compatible base URL (for OpenAI-speaking clients) is:",
+        "  endpoint via its GOOGLE_GEMINI_BASE_URL setting — point it at",
+        "  the proxy's Gemini-compatible base URL:",
+        "",
+        f"    GOOGLE_GEMINI_BASE_URL={gemini_base_url}",
+        "",
+        "  For OpenAI-speaking clients, the proxy's OpenAI-compatible",
+        "  base URL is:",
         "",
         f"    Base URL:  {targets.openai_base_url}",
         "    API Key:   your-openai-api-key",
