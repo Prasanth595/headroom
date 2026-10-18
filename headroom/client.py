@@ -325,7 +325,7 @@ class HeadroomClient:
             self._config.model_context_limits.update(model_context_limits)
 
         # Initialize storage
-        self._storage = create_storage(store_url)
+        self._storage = create_storage(self._store_url)
 
         # Initialize transform pipeline
         self._pipeline = TransformPipeline(self._config, provider=self._provider)
