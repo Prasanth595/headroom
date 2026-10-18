@@ -26,6 +26,7 @@ from headroom.learn.fixtures import (
 )
 from headroom.learn.loops import (
     _IDENTITY_FIELDS,
+    LoopPattern,
     _canonical_signature,
     _identity_input,
     _signature_tokens,
@@ -149,6 +150,22 @@ class TestDigestSurfacesLoops:
     def test_digest_without_loops_has_no_loop_section(self):
         digest = _build_digest(_project(), [one_off_error_session()])
         assert "Detected Loops" not in digest
+
+    def test_loop_section_stays_inside_the_digest_budget(self):
+        # Rendered whole, thousands of loops with hundreds of indices each made
+        # a 1.79M-char prompt, over Codex's 1,048,576-char input cap.
+        loops = [
+            LoopPattern("Bash", "s", "x" * 120, 300, False, 1_000_000 - i, list(range(300)))
+            for i in range(2000)
+        ]
+        full = _build_digest(_project(), [], loops=loops)
+        small = _build_digest(_project(), [], loops=loops, max_tokens=10_000)
+        assert len(full) < 80_000  # a quarter of the 80k-token budget's chars
+        assert len(small) < 10_000
+        # The costliest loops are the ones kept, and the caller's list is intact.
+        assert "~1,000,000 tokens wasted" in small
+        assert "~999,000 tokens wasted" not in full
+        assert len(loops[0].msg_indices) == 300
 
 
 # =============================================================================

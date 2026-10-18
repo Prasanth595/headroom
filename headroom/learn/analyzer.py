@@ -23,6 +23,7 @@ import subprocess
 import threading
 import time
 import typing
+from dataclasses import replace
 
 from headroom._subprocess import Popen, run
 
@@ -52,6 +53,13 @@ _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + ou
 # budget halves on each "prompt is too long" failure; below this the digest
 # carries too little signal to produce useful recommendations.
 _MIN_DIGEST_TOKENS = 10_000
+# The loop section precedes the budgeted event stream, so it is bounded on its
+# own: one loop per this many digest tokens (a rendered loop line is ~100
+# tokens, so the section stays under a quarter of the budget and halves with it
+# on a retry), each listing its first _MAX_LOOP_INDICES message indices beside
+# its repeat count.
+_DIGEST_TOKENS_PER_LOOP = 400
+_MAX_LOOP_INDICES = 20
 
 # CLI tools to try when no API key is set (checked in order).
 # Each entry: (binary_name, model_identifier, command_prefix). The claude-cli
@@ -393,8 +401,16 @@ def _build_digest(
     lines.append("")
 
     # Detected loops first — the most expensive waste pattern, so the LLM sees
-    # it before the (budget-truncatable) per-session event stream.
-    loop_section = format_loops_for_digest(loops)
+    # it before the (budget-truncatable) per-session event stream. Only the
+    # costliest fit (detect_loops sorts by waste): rendered whole, every loop
+    # with every index, the section alone outgrew the digest on a machine with
+    # years of Codex sessions, which learn scans as one project.
+    loop_section = format_loops_for_digest(
+        [
+            replace(lp, msg_indices=lp.msg_indices[:_MAX_LOOP_INDICES])
+            for lp in loops[: max_tokens // _DIGEST_TOKENS_PER_LOOP]
+        ]
+    )
     if loop_section:
         lines.append(loop_section)
 
