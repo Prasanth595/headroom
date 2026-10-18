@@ -1379,3 +1379,83 @@ describe("Anthropic user document blocks", () => {
     expect(fromOpenAI(toOpenAI(original), "anthropic")).toEqual(original);
   });
 });
+
+describe("Anthropic document sources (text, content, file) and document fields", () => {
+  it("keeps a document-only user turn with a text source, title and citations through the public path", () => {
+    const input = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: { type: "text", media_type: "text/plain", data: "Critical contract: do not delete account 123" },
+            title: "Contract",
+            citations: { enabled: true },
+          },
+        ],
+      },
+    ];
+    expect(detectFormat(input)).toBe("anthropic");
+    const wire = toOpenAI(input);
+    expect(wire).toHaveLength(1);
+    expect((wire[0].content as any)[0].type).toBe("image_url");
+    expect(fromOpenAI(wire, "anthropic")).toEqual(input);
+  });
+
+  it("round-trips a mixed text + text-document turn with context exactly", () => {
+    const input = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize" },
+          { type: "document", source: { type: "text", media_type: "text/plain", data: "clause 1\nclause 2" }, context: "Contract excerpt" },
+        ],
+      },
+    ];
+    expect(fromOpenAI(toOpenAI(input), "anthropic")).toEqual(input);
+  });
+
+  it("carries content-source and file-source documents verbatim", () => {
+    const input = [
+      {
+        role: "user",
+        content: [
+          { type: "document", source: { type: "content", content: [{ type: "text", text: "clause 1" }] }, title: "Doc" },
+          { type: "document", source: { type: "file", file_id: "file_abc" } },
+        ],
+      },
+    ];
+    expect(fromOpenAI(toOpenAI(input), "anthropic")).toEqual(input);
+  });
+
+  it("restores a PDF document's title, context and citations", () => {
+    const input = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" },
+            title: "Report",
+            context: "Q3",
+            citations: { enabled: true },
+          },
+        ],
+      },
+    ];
+    expect(fromOpenAI(toOpenAI(input), "anthropic")).toEqual(input);
+  });
+
+  it("round-trips an assistant document with a title", () => {
+    const input = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "see attached" },
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" }, title: "Report" },
+        ],
+      },
+    ];
+    expect(fromOpenAI(toOpenAI(input), "anthropic")).toEqual(input);
+  });
+});

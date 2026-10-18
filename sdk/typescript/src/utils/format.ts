@@ -95,35 +95,69 @@ function openAIImageBlock(url: string): any {
   return { type: "image", source: { type: "url", url } };
 }
 
+type AnthropicMediaImageUrl = {
+  url: string;
+  mime_type?: string;
+  // A plain-text document source travels as a data: URI and is tagged so it is restored as
+  // text, not base64; sources the OpenAI shape cannot express (content, file) are carried
+  // verbatim on `source`. The document's own fields are carried on `document`.
+  source_type?: "text";
+  source?: any;
+  document?: Record<string, any>;
+};
+
+const ANTHROPIC_DOCUMENT_FIELDS = ["title", "context", "citations", "cache_control"] as const;
+
 // Anthropic media block -> OpenAI image_url object, or null if unconvertible: image blocks via
-// anthropicImageUrl; document blocks (PDF) as a data: URI, or a url with the MIME type carried on
-// the private `mime_type` key.
-function anthropicMediaImageUrl(block: any): { url: string; mime_type?: string } | null {
+// anthropicImageUrl; document blocks by source — base64 PDF as a data: URI, url with the MIME
+// type carried on the private `mime_type` key, plain text as a tagged data: URI, and content /
+// file sources carried verbatim — plus the document's title / context / citations / cache_control.
+function anthropicMediaImageUrl(block: any): AnthropicMediaImageUrl | null {
   if (block.type === "image") {
     const url = anthropicImageUrl(block.source);
     return url ? { url } : null;
   }
-  if (block.type === "document" && block.source && typeof block.source === "object") {
-    const src = block.source;
-    if (src.type === "base64" && src.media_type && src.data) {
-      return { url: `data:${src.media_type};base64,${src.data}` };
-    }
-    if (src.type === "url" && typeof src.url === "string") return { url: src.url, mime_type: "application/pdf" };
+  if (block.type !== "document" || !block.source || typeof block.source !== "object") return null;
+  const src = block.source;
+  let out: AnthropicMediaImageUrl;
+  if (src.type === "base64" && src.media_type && src.data) {
+    out = { url: `data:${src.media_type};base64,${src.data}` };
+  } else if (src.type === "url" && typeof src.url === "string") {
+    out = { url: src.url, mime_type: "application/pdf" };
+  } else if (src.type === "text" && typeof src.data === "string") {
+    out = {
+      url: `data:${src.media_type || "text/plain"};base64,${bytesToBase64(new TextEncoder().encode(src.data))}`,
+      source_type: "text",
+    };
+  } else {
+    out = { url: "data:;base64,", source: src };
   }
-  return null;
+  const fields: Record<string, any> = {};
+  for (const k of ANTHROPIC_DOCUMENT_FIELDS) if (block[k] !== undefined) fields[k] = block[k];
+  if (Object.keys(fields).length > 0) out.document = fields;
+  return out;
 }
 
 // OpenAI image_url -> Anthropic media block, or null when Anthropic has no block for that media:
-// image/* (or unknown) -> image block; application/pdf -> document block (base64 or url source).
+// a carried document source or text document is rebuilt as a document block with its fields;
+// application/pdf -> document block (base64 or url source); image/* (or unknown) -> image block.
 function anthropicMediaBlock(imageUrl: any): any {
   const url: string = imageUrl.url;
   const m = /^data:([^;,]*);base64,(.*)$/s.exec(url);
   const mediaType: string | undefined =
     (m && m[1]) || (typeof imageUrl.mime_type === "string" ? imageUrl.mime_type : undefined);
+  const fields = imageUrl.document && typeof imageUrl.document === "object" ? imageUrl.document : {};
+  if (imageUrl.source && typeof imageUrl.source === "object") {
+    return { type: "document", source: imageUrl.source, ...fields };
+  }
+  if (imageUrl.source_type === "text" && m) {
+    return { type: "document", source: { type: "text", media_type: "text/plain", data: base64ToText(m[2]) }, ...fields };
+  }
   if (mediaType === "application/pdf") {
-    return m
-      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: m[2] } }
-      : { type: "document", source: { type: "url", url } };
+    const source = m
+      ? { type: "base64", media_type: "application/pdf", data: m[2] }
+      : { type: "url", url };
+    return { type: "document", source, ...fields };
   }
   if (mediaType === undefined || mediaType.startsWith("image/")) return openAIImageBlock(url);
   return null;
