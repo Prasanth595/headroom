@@ -146,8 +146,9 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                             "data_paths": [],
                         },
                     )
-                    if brain_dir not in entry["data_paths"]:
-                        entry["data_paths"].append(brain_dir)
+                    # Record the transcript itself so scan_project() need not
+                    # re-detect every transcript in brain/ for each project.
+                    entry["data_paths"].append(tf)
                 else:
                     unmapped_transcripts.append(tf)
 
@@ -218,13 +219,12 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
                         seen_files.add(gf)
                         scan_items.append((gf, self._scan_session))
 
-            # 2. Antigravity transcripts
+            # 2. Antigravity transcripts. Discovery lists each transcript under
+            # the one project it maps to, so a listed file is taken as is.
             if p.is_file() and p.name == "transcript.jsonl":
                 if p not in seen_files:
-                    detected = self._detect_antigravity_project_path(p)
-                    if detected is None or detected == project.project_path:
-                        seen_files.add(p)
-                        scan_items.append((p, self._scan_antigravity_transcript))
+                    seen_files.add(p)
+                    scan_items.append((p, self._scan_antigravity_transcript))
             elif p.is_dir():
                 transcripts = sorted(p.rglob("transcript.jsonl"))
                 for tf in transcripts:

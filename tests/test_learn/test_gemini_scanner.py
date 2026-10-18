@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -925,13 +926,20 @@ class TestAntigravityDiscoveryAndParsing:
         proj = projects[0]
         assert proj.project_path == project_dir
         data_paths = [proj.data_path, *proj.extra_data_paths]
-        assert len(data_paths) == 3
+        assert len(data_paths) == 5
         assert chats_dir in data_paths
-        assert (gemini_dir / "antigravity-cli" / "brain") in data_paths
-        assert (gemini_dir / "antigravity-ide" / "brain") in data_paths
+        for app in ("antigravity-cli", "antigravity-ide"):
+            for transcript in (gemini_dir / app / "brain").rglob("transcript.jsonl"):
+                assert transcript in data_paths
 
-        # Scan project aggregates all 5 sessions across all 3 locations
-        sessions = scanner.scan_project(proj)
+        # Scan project aggregates all 5 sessions across all 3 locations, reusing
+        # discovery's workspace mapping instead of re-reading every transcript.
+        with mock.patch.object(
+            GeminiScanner,
+            "_detect_antigravity_project_path",
+            side_effect=AssertionError("scan_project must not re-detect workspaces"),
+        ):
+            sessions = scanner.scan_project(proj)
         assert len(sessions) == 5
 
         # All session IDs must be unique
