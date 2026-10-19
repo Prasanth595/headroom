@@ -23,7 +23,6 @@ import subprocess
 import threading
 import time
 import typing
-from dataclasses import replace
 
 from headroom._subprocess import Popen, run
 
@@ -53,13 +52,6 @@ _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + ou
 # budget halves on each "prompt is too long" failure; below this the digest
 # carries too little signal to produce useful recommendations.
 _MIN_DIGEST_TOKENS = 10_000
-# The loop section precedes the budgeted event stream, so it is bounded on its
-# own: one loop per this many digest tokens (a rendered loop line is ~100
-# tokens, so the section stays under a quarter of the budget and halves with it
-# on a retry), each listing its first _MAX_LOOP_INDICES message indices beside
-# its repeat count.
-_DIGEST_TOKENS_PER_LOOP = 400
-_MAX_LOOP_INDICES = 20
 
 # CLI tools to try when no API key is set (checked in order).
 # Each entry: (binary_name, model_identifier, command_prefix). The claude-cli
@@ -344,8 +336,9 @@ def _is_prompt_too_long(exc: Exception) -> bool:
 
     Matches the known phrasings across backends: claude CLI ("Prompt is too
     long"), Anthropic via LiteLLM ("prompt is too long: N tokens > M maximum"),
-    OpenAI ("context_length_exceeded" / "maximum context length"), and Gemini
-    ("input token count exceeds the maximum").
+    OpenAI ("context_length_exceeded" / "maximum context length"), Gemini
+    ("input token count exceeds the maximum"), and the codex CLI ("Input exceeds
+    the maximum length of 1048576 characters").
     """
     msg = str(exc).lower()
     return any(
@@ -356,6 +349,7 @@ def _is_prompt_too_long(exc: Exception) -> bool:
             "maximum context length",
             "context window",
             "token count exceeds",
+            "input exceeds the maximum length",
         )
     )
 
@@ -400,29 +394,32 @@ def _build_digest(
         lines.append(f"Tokens used: {total_tokens_in:,} in / {total_tokens_out:,} out")
     lines.append("")
 
-    # Detected loops first — the most expensive waste pattern, so the LLM sees
-    # it before the (budget-truncatable) per-session event stream. Only the
-    # costliest fit (detect_loops sorts by waste): rendered whole, every loop
-    # with every index, the section alone outgrew the digest on a machine with
-    # years of Codex sessions, which learn scans as one project.
-    loop_section = format_loops_for_digest(
-        [
-            replace(lp, msg_indices=lp.msg_indices[:_MAX_LOOP_INDICES])
-            for lp in loops[: max_tokens // _DIGEST_TOKENS_PER_LOOP]
-        ]
-    )
-    if loop_section:
-        lines.append(loop_section)
-
-    # Prior learned patterns (if any) — gives the LLM the current baseline so
-    # it can produce complete updated sections instead of condensed deltas.
-    prior_section = _build_prior_patterns_section(project)
-    if prior_section:
-        lines.append(prior_section)
-
     # Budget tracking — stop adding events when we approach the limit
     # Rough estimate: 4 chars per token
     char_budget = max_tokens * 4
+
+    # Prior learned patterns (if any) — gives the LLM the current baseline so
+    # it can produce complete updated sections instead of condensed deltas.
+    # Never cut: a re-emitted section replaces its prior one wholesale, so a
+    # partial baseline would drop the missing bullets from the written file.
+    prior_section = _build_prior_patterns_section(project)
+
+    # Detected loops first — the most expensive waste pattern, so the LLM sees
+    # it before the (budget-truncatable) per-session event stream. The event
+    # stream cannot trim a section placed ahead of it, so the loops get their
+    # own cap: a quarter of the budget, less whatever the header and prior
+    # patterns leave short. Rendered whole, every loop with every index, the
+    # section alone outgrew the digest on a machine with years of Codex
+    # sessions, which learn scans as one project.
+    pre_event_chars = sum(len(ln) for ln in lines) + len(prior_section)
+    loop_section = format_loops_for_digest(
+        loops, max_chars=min(char_budget // 4, char_budget - pre_event_chars)
+    )
+    if loop_section:
+        lines.append(loop_section)
+    if prior_section:
+        lines.append(prior_section)
+
     chars_used = sum(len(ln) for ln in lines)
 
     for session in sessions:

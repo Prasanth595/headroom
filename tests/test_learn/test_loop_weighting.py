@@ -151,21 +151,55 @@ class TestDigestSurfacesLoops:
         digest = _build_digest(_project(), [one_off_error_session()])
         assert "Detected Loops" not in digest
 
-    def test_loop_section_stays_inside_the_digest_budget(self):
+    @pytest.mark.parametrize("max_tokens", [80_000, 10_000])
+    @pytest.mark.parametrize(
+        ("tool", "sample"),
+        [
+            ("Bash", "x" * 120),
+            ("Grep", "x" * 2000),  # a long search pattern
+            ("Glob", "src/" * 500 + "*.py"),  # a long path
+        ],
+        ids=["bash", "long-grep-pattern", "long-glob-path"],
+    )
+    def test_loop_section_stays_inside_the_digest_budget(self, tool, sample, max_tokens):
         # Rendered whole, thousands of loops with hundreds of indices each made
         # a 1.79M-char prompt, over Codex's 1,048,576-char input cap.
         loops = [
-            LoopPattern("Bash", "s", "x" * 120, 300, False, 1_000_000 - i, list(range(300)))
+            LoopPattern(tool, "s", sample, 300, False, 1_000_000 - i, list(range(300)))
             for i in range(2000)
         ]
-        full = _build_digest(_project(), [], loops=loops)
-        small = _build_digest(_project(), [], loops=loops, max_tokens=10_000)
-        assert len(full) < 80_000  # a quarter of the 80k-token budget's chars
-        assert len(small) < 10_000
+        digest = _build_digest(_project(), [], loops=loops, max_tokens=max_tokens)
+        section = digest[digest.index("=== Detected Loops") :]
+        assert len(section) <= max_tokens  # a quarter of the budget's chars
         # The costliest loops are the ones kept, and the caller's list is intact.
-        assert "~1,000,000 tokens wasted" in small
-        assert "~999,000 tokens wasted" not in full
+        assert "~1,000,000 tokens wasted" in section
+        assert "~999,000 tokens wasted" not in section
+        assert loops[0].sample_input == sample
         assert len(loops[0].msg_indices) == 300
+
+    @pytest.mark.parametrize("max_tokens", [80_000, 10_000])
+    def test_loops_fit_beside_a_large_prior_patterns_section(self, tmp_path, max_tokens):
+        # The event stream cannot trim sections placed ahead of it, so the
+        # loops give way to the prior patterns, which are never cut.
+        bullets = "".join(f"- rule {i:06d} {'y' * 80}\n" for i in range(max_tokens * 4 // 100))
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text(
+            f"<!-- headroom:learn:start -->\n{bullets}<!-- headroom:learn:end -->\n"
+        )
+        project = ProjectInfo(
+            name="proj",
+            project_path=tmp_path,
+            data_path=tmp_path / "data",
+            context_file=claude_md,
+        )
+        loops = [
+            LoopPattern("Grep", "s", "x" * 2000, 300, False, 1_000_000 - i, list(range(300)))
+            for i in range(25)
+        ]
+        digest = _build_digest(project, [], loops=loops, max_tokens=max_tokens)
+        assert bullets.splitlines()[-1] in digest
+        assert "~1,000,000 tokens wasted" in digest
+        assert len(digest) <= max_tokens * 4
 
 
 # =============================================================================
