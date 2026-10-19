@@ -1136,3 +1136,33 @@ def test_unix_env_failure_restores_earlier_targets_when_existing_target_rejects_
         providers._apply_unix_env_scope(manifest)
     assert bashrc.read_text(encoding="utf-8") == "# bash\n"
     assert zshrc.read_text(encoding="utf-8") == "# zsh\n"
+
+
+def test_unix_env_block_round_trips_shell_special_values(monkeypatch, tmp_path: Path) -> None:
+    import shutil
+    import subprocess
+
+    from headroom.install import providers
+
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available")
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    manifest.base_env = {
+        "HTTPS_PROXY": "http://bob:pa$$w0rd@proxy:3128",
+        "HEADROOM_JSON": '{"a": "b"}',
+        "HEADROOM_TICK": "`id`",
+    }
+    bashrc = tmp_path / ".bashrc"
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc])
+
+    providers._apply_unix_env_scope(manifest)
+    # Re-apply over the existing block, with a value containing backslashes.
+    manifest.base_env["HEADROOM_WORKSPACE_DIR"] = r"C:\new\dir \d+"
+    providers._apply_unix_env_scope(manifest)
+
+    names = list(manifest.base_env)
+    script = f"source {bashrc}; " + "; ".join(f'printf "%s\\0" "${name}"' for name in names)
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+    assert result.stdout.split("\0")[:-1] == list(manifest.base_env.values())
+    assert bashrc.read_text(encoding="utf-8").count("# >>> headroom persistent env >>>") == 1
