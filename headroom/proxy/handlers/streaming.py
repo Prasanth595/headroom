@@ -20,6 +20,7 @@ from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     jitter_delay_ms,
     overload_retry_is_futile,
+    parse_sse_events_from_byte_buffer,
     retry_after_ms,
 )
 from headroom.proxy.provider_usage import (
@@ -1656,6 +1657,9 @@ class StreamingMixin:
             # the outcome only, so pending messages are not drained into a
             # stream nobody reads.
             client_left_after_terminal = False
+            # A terminal event the client was handed, not just one parsed from
+            # upstream: the memory filter holds message_stop until the end.
+            client_got_terminal = False
             pending_messages: list[dict] = []
             # Proxy-injected memory tools are invisible to the client, so their
             # tool_use blocks must never reach it (GH #2195).
@@ -1664,6 +1668,23 @@ class StreamingMixin:
                 if memory_enabled and server_memory_tool_names
                 else None
             )
+
+            def _client_frame(frame: bytes) -> bytes:
+                """``_guard_client_bytes``, noting when the terminal event goes out."""
+                nonlocal client_got_terminal
+                guarded = _guard_client_bytes(frame)
+                if guarded and not client_got_terminal:
+                    if memory_filter is None:
+                        # Unfiltered, the client gets each whole chunk once it
+                        # is parsed, so every event the parser has seen.
+                        client_got_terminal = stream_state["stream_terminal"]
+                    else:
+                        # Filtered frames are complete events the filter decoded.
+                        client_got_terminal = any(
+                            _sse_event_outcome(name, data, stream_state["sse_dialect"])[1]
+                            for name, data in parse_sse_events_from_byte_buffer(bytearray(frame))
+                        )
+                return guarded
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
@@ -1726,8 +1747,14 @@ class StreamingMixin:
                                 )
                                 memory_enabled = False
 
-                        # Parse complete SSE events from buffer
-                        usage = self._parse_sse_usage_from_buffer(stream_state, provider)
+                        # Parse complete SSE events from buffer. A failure (e.g.
+                        # invalid UTF-8) is raised once the chunk is forwarded:
+                        # malformed upstream content still reaches the client.
+                        parse_error: Exception | None = None
+                        try:
+                            usage = self._parse_sse_usage_from_buffer(stream_state, provider)
+                        except Exception as e:
+                            usage, parse_error = None, e
                         if usage:
                             if "input_tokens" in usage:
                                 stream_state["input_tokens"] = usage["input_tokens"]
@@ -1762,9 +1789,11 @@ class StreamingMixin:
                             [chunk] if memory_filter is None else memory_filter.feed(chunk)
                         )
                         for frame in client_frames:
-                            guarded_frame = _guard_client_bytes(frame)
+                            guarded_frame = _client_frame(frame)
                             if guarded_frame:
                                 yield guarded_frame
+                        if parse_error is not None:
+                            raise parse_error
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
@@ -1787,7 +1816,7 @@ class StreamingMixin:
                         )
                         if memory_filter is not None:
                             for frame in memory_filter.closing_frames():
-                                guarded_frame = _guard_client_bytes(frame)
+                                guarded_frame = _client_frame(frame)
                                 if guarded_frame:
                                     yield guarded_frame
                         guarded_tail = _drain_context_guard()
@@ -1811,7 +1840,7 @@ class StreamingMixin:
                             stream_state=stream_state,
                             request_id=request_id,
                         ):
-                            guarded_frame = _guard_client_bytes(frame)
+                            guarded_frame = _client_frame(frame)
                             if guarded_frame:
                                 yield guarded_frame
                         memory_filter = None
@@ -1856,7 +1885,7 @@ class StreamingMixin:
                         stream_state=stream_state,
                         request_id=request_id,
                     ):
-                        guarded_frame = _guard_client_bytes(frame)
+                        guarded_frame = _client_frame(frame)
                         if guarded_frame:
                             yield guarded_frame
 
@@ -1911,7 +1940,7 @@ class StreamingMixin:
                 # Codex closes the connection as soon as it reads
                 # response.completed, before the upstream EOF ends the loop.
                 client_left_after_terminal = (
-                    stream_state["stream_terminal"] and not stream_state["stream_failed"]
+                    client_got_terminal and not stream_state["stream_failed"]
                 )
                 raise
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
