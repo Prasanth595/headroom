@@ -3018,6 +3018,17 @@ def _auth_rejection_context(headers: Mapping[str, str]) -> tuple[str, str]:
     return ua, "invalid" if getattr(address, "scope_id", None) else str(address)
 
 
+def _auth_rejection_path(path: object) -> str:
+    """The request path for a rejection log line, with control characters escaped.
+
+    The ASGI server percent-decodes the path, so an unauthenticated caller can
+    put raw CR/LF, NUL or terminal escapes in it (``%0A``, ``%1B``) and forge or
+    garble log lines. ``unicode_escape`` renders every non-printable or
+    non-ASCII character (and the backslash itself) as an escape sequence.
+    """
+    return str(path).encode("unicode_escape").decode("ascii")
+
+
 _PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"
 
 
@@ -3146,7 +3157,7 @@ class WebSocketAuthMiddleware:
         logger.warning(
             "event=proxy_auth_rejected transport=websocket path=%s client=%s reason=%s "
             "ua=%s xff=%s",
-            scope.get("path"),
+            _auth_rejection_path(scope.get("path")),
             client_host,
             "missing_token" if provided is None else "bad_token",
             user_agent,
@@ -4258,7 +4269,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         "event=proxy_auth_rejected method=%s path=%s client=%s reason=%s "
                         "ua=%s xff=%s",
                         request.method,
-                        path,
+                        _auth_rejection_path(path),
                         client_host,
                         "missing_token" if provided is None else "bad_token",
                         user_agent,

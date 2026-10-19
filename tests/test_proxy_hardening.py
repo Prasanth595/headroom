@@ -301,6 +301,18 @@ class TestAuthRejectionLog:
         assert CANARY not in line
         assert line.endswith(tail)
 
+    def test_path_cannot_smuggle_control_characters(self):
+        # The ASGI server percent-decodes the path. Starlette's URL parsing
+        # drops CR/LF/TAB from request.url.path, but every other control
+        # character (NUL, ESC for terminal escapes, U+2028) reaches the line.
+        app = _make_app(proxy_token="s3cr3t-token")
+        with _captured_proxy_warnings() as messages:
+            with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+                c.get("/stats%0D%0A%1B%5B1Aevent=forged%00%E2%80%A8")
+        (line,) = _rejections(messages)
+        assert line.isprintable()
+        assert "path=/stats\\x1b[1Aevent=forged\\x00\\u2028 client=" in line
+
     def test_context_is_a_fixed_vocabulary(self):
         # Exercised directly: an HTTP client refuses to send CR/LF in a header,
         # but an ASGI server in front of the proxy is not guaranteed to.
@@ -466,6 +478,17 @@ class TestWebSocketAuthMiddleware:
         assert CANARY not in line
         assert line.endswith("ua=other xff=invalid")
         assert "wrong-ws-bearer" not in line and "s3cr3t-token" not in line
+
+    async def test_rejection_log_path_cannot_forge_a_line(self):
+        mw = WebSocketAuthMiddleware(_SpyApp(), proxy_token="s3cr3t-token")
+        scope = _ws_scope(path="/v1/responses\r\nevent=proxy_auth_rejected")
+
+        with _captured_proxy_warnings() as messages:
+            await _drive(mw, scope)
+
+        (line,) = _rejections(messages)
+        assert "\r" not in line and "\n" not in line
+        assert "path=/v1/responses\\r\\nevent=proxy_auth_rejected " in line
 
     async def test_accepts_correct_bearer(self):
         downstream = _SpyApp()
