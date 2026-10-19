@@ -2029,15 +2029,15 @@ class AnthropicHandlerMixin:
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
-                        if getattr(prefix_tracker, "restored_from_disk", False):
-                            # Resumed after a restart (HEADROOM_PREFIX_STATE_FILE):
-                            # seed the empty cache with what was forwarded, or the
-                            # clamp below freezes nothing and read maturation
-                            # rewrites Reads inside the cached prefix.
-                            prefix_tracker.restored_from_disk = False
-                            comp_cache.update_from_result(
-                                previous_original_messages, previous_forwarded_messages
-                            )
+                        from headroom.cache.prefix_tracker import (
+                            seed_restored_compression_cache,
+                        )
+
+                        # Seeds the empty cache after a restart
+                        # (HEADROOM_PREFIX_STATE_FILE); without it the clamp below
+                        # freezes nothing and read maturation rewrites Reads
+                        # inside the cached prefix.
+                        seed_restored_compression_cache(prefix_tracker, comp_cache)
 
                         # Freeze + stable marking + Zone-1 swap now live in the
                         # shared session engine (PROXY policy: clamp by BOTH the

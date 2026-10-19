@@ -16,19 +16,27 @@ replays the exact prefix the provider cached.
 from __future__ import annotations
 
 import contextvars
+import errno
 import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 pytest.importorskip("fastapi")
 
+import httpx
+from fastapi.testclient import TestClient
+
 from headroom.cache import prefix_tracker
-from headroom.cache.compression_store import reset_compression_store
+from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.cache.prefix_tracker import PREFIX_STATE_FILE_ENV, SessionTrackerStore
+from headroom.ccr.tool_injection import CCRToolInjector
+from headroom.config import TransformResult
+from headroom.proxy.server import ProxyConfig, create_app
 from headroom.transforms.pipeline import TransformPipeline
 from tests.test_anthropic_fork_lineage_cache import (
     _drive,
@@ -43,6 +51,11 @@ from tests.test_anthropic_fork_lineage_cache import (
 def _wire(messages: list[dict[str, Any]]) -> str:
     """The bytes the provider keys its prefix cache on (breakpoints excluded)."""
     return json.dumps(_strip(messages))
+
+
+def _ccr_hashes(messages: list[dict[str, Any]]) -> set[str]:
+    """Retrieval references the model sees, found the way the proxy finds them."""
+    return set(CCRToolInjector().scan_for_markers(messages))
 
 
 def _with_fake_kompress(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -125,10 +138,11 @@ _SCENARIOS = {
 
 def _restart_between_turns(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, dict[str, str]]:
     """Some turns in one proxy, the next turn in a fresh one, one warm
     provider cache. Returns (last forwarded before, first forwarded after,
-    its read hit)."""
+    its read hit, the original behind each retrieval reference forwarded
+    before the restart)."""
     build, turns, config, kompress = _SCENARIOS[scenario]
     monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
     # As the desktop app runs it: a cold start forwards the fast pass.
@@ -140,9 +154,11 @@ def _restart_between_turns(
     cache = _PromptCache()
     reset_compression_store()
     before = _drive([build(n) for n in range(1, turns + 1)], cache, **config)
+    store = get_compression_store()
+    originals = {h: store.retrieve(h).original_content for h in _ccr_hashes(before[-1][0])}  # type: ignore[union-attr]
     reset_compression_store()  # nothing in process memory survives a restart
     (after,) = _drive([build(turns + 1)], cache, **config)
-    return before[-1][0], after[0], after[1]
+    return before[-1][0], after[0], after[1], originals
 
 
 @pytest.mark.parametrize("scenario", list(_SCENARIOS))
@@ -152,10 +168,32 @@ def test_first_request_after_a_restart_replays_the_cached_prefix(
     state = tmp_path / "prefix-state.json"
     monkeypatch.setenv(PREFIX_STATE_FILE_ENV, str(state))
 
-    previous, current, hit = _restart_between_turns(monkeypatch, tmp_path, scenario)
+    previous, current, hit, _ = _restart_between_turns(monkeypatch, tmp_path, scenario)
 
     assert _wire(current[: len(previous)]) == _wire(previous)
     assert hit >= len(previous) - 1, f"read only {hit + 1}/{len(previous)} cached messages"
+
+
+def test_restored_retrieval_references_resolve_to_their_originals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review of #4299: matching bytes are not enough. With the in-process CCR
+    backend a restart emptied the store, so a matured Read the restored
+    tracker kept replaying pointed at a hash that no longer resolved."""
+    monkeypatch.setenv(PREFIX_STATE_FILE_ENV, str(tmp_path / "prefix-state.json"))
+
+    previous, current, _, originals = _restart_between_turns(
+        monkeypatch, tmp_path, "read-maturation"
+    )
+
+    emitted = _ccr_hashes(current)
+    assert emitted & originals.keys(), "no pre-restart reference was replayed"
+    store = get_compression_store()
+    for h in emitted:
+        entry = store.retrieve(h)
+        assert entry is not None, f"hash={h} does not resolve after the restart"
+        if h in originals:
+            assert entry.original_content == originals[h]
 
 
 @pytest.mark.parametrize("scenario", list(_SCENARIOS))
@@ -166,7 +204,7 @@ def test_without_the_state_file_a_restart_rewrites_the_prefix(
     the test above is not vacuous."""
     monkeypatch.delenv(PREFIX_STATE_FILE_ENV, raising=False)
 
-    previous, current, hit = _restart_between_turns(monkeypatch, tmp_path, scenario)
+    previous, current, hit, _ = _restart_between_turns(monkeypatch, tmp_path, scenario)
 
     assert _wire(current[: len(previous)]) != _wire(previous)
     assert hit < len(previous) - 1
@@ -286,6 +324,184 @@ def test_stateless_mode_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert not path.exists()
 
 
+def test_a_stateless_proxy_leaves_a_saved_snapshot_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Loading deletes the file, so a stateless start must not load it: the
+    next normal start resumes those conversations."""
+    path = tmp_path / "state.json"
+    assert _two_conversations().save_state(str(path)) == 2
+    saved = path.read_text()
+    monkeypatch.setenv(PREFIX_STATE_FILE_ENV, str(path))
+    monkeypatch.setenv("HEADROOM_STATELESS", "1")
+
+    _drive([])  # one stateless proxy start and graceful shutdown
+
+    assert path.read_text() == saved
+    monkeypatch.delenv("HEADROOM_STATELESS")
+    assert SessionTrackerStore().load_state(str(path)) == 2
+
+
+def test_a_failed_save_keeps_the_previous_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "state.json"
+    assert _two_conversations().save_state(str(path)) == 2
+    saved = path.read_text()
+
+    def disk_full(*args: Any, **kwargs: Any) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("headroom.fsutil.write_text", disk_full)
+    assert _two_conversations().save_state(str(path)) == 0
+
+    assert path.read_text() == saved
+
+
+def test_saved_ccr_entries_resolve_after_a_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Store level, compressor markers in the replayed prefix: both hash
+    formats resolve to the same original with the same expiry after the
+    in-process CCR store is emptied, and an entry that expired does not."""
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    reset_compression_store()
+    ccr = get_compression_store()
+    rows = ccr.store(json.dumps(list(range(400))), "[0, 1]", ttl=900)
+    blob = ccr.store("x" * 5000, "", ttl=900, explicit_hash="abcdef123456")
+    gone = ccr.store("expired original", "", ttl=900)
+    ccr._backend.get(gone).created_at -= 1000  # type: ignore[union-attr]
+    expires = {h: ccr.get_entry_status(h)["expires_at"] for h in (rows, blob)}
+    text = (
+        f"[400 items compressed to 2. Retrieve more: hash={rows}] "
+        f"<<ccr:{blob},base64,4.9KB>> [stale. Retrieve original: hash={gone}]"
+    )
+    store = SessionTrackerStore()
+    contextvars.Context().run(_send, store, [{"role": "user", "content": text}])
+    path = str(tmp_path / "state.json")
+    assert store.save_state(path) == 1
+    reset_compression_store()
+
+    assert SessionTrackerStore().load_state(path) == 1
+
+    ccr = get_compression_store()
+    assert ccr.retrieve(rows).original_content == json.dumps(list(range(400)))  # type: ignore[union-attr]
+    assert ccr.retrieve(blob).original_content == "x" * 5000  # type: ignore[union-attr]
+    assert ccr.retrieve(gone) is None
+    for h, at in expires.items():
+        assert abs(ccr.get_entry_status(h)["expires_at"] - at) < 2
+    reset_compression_store()
+
+
+def _chat_turns(n: int) -> list[dict[str, Any]]:
+    """An OpenAI chat agent: one big tool result, then ``n - 1`` follow-ups."""
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "run the build and show me the log"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "build log line OK\n" * 200},
+    ]
+    for i in range(1, n):
+        messages += [
+            {"role": "assistant", "content": f"answer {i}"},
+            {"role": "user", "content": "and now?"},
+        ]
+    return messages
+
+
+def _relevance_pipeline(**kwargs: Any) -> TransformResult:
+    """Query-dependent compression, like SmartCrusher's relevance scoring: the
+    same tool result compresses differently under a different user query."""
+    frozen = kwargs.get("frozen_message_count") or 0
+    query = next(m["content"] for m in reversed(kwargs["messages"]) if m["role"] == "user")
+    messages = [
+        {**m, "content": f"[log: kept lines relevant to {query!r}]"}
+        if i >= frozen and m.get("role") == "tool"
+        else m
+        for i, m in enumerate(kwargs["messages"])
+    ]
+    return TransformResult(
+        messages=messages, tokens_before=2000, tokens_after=40, transforms_applied=["relevance"]
+    )
+
+
+def _drive_openai_chat(requests: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    """Each history through the real OpenAI chat handler in token mode; one
+    app per call, so a second call is a proxy restart."""
+    app = create_app(
+        ProxyConfig(
+            optimize=True,
+            mode="token",
+            disable_kompress=True,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    forwarded: list[list[dict[str, Any]]] = []
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.openai_pipeline.apply = _relevance_pipeline
+
+        async def _upstream(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN003
+            forwarded.append(json.loads(json.dumps(body["messages"])))
+            # Automatic prefix caching reports nothing cached on a
+            # conversation's first request, so there is no confirmed floor.
+            usage = {"prompt_tokens": 600, "completion_tokens": 3, "total_tokens": 603}
+            usage["prompt_tokens_details"] = {"cached_tokens": 0}
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_x",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": usage,
+                },
+            )
+
+        proxy._retry_request = _upstream
+        for messages in requests:
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer test-key"},
+                json={"model": "gpt-4o-mini", "messages": messages},
+            )
+            assert response.status_code == 200, response.text[:300]
+    return forwarded
+
+
+def test_openai_token_mode_replays_its_prefix_after_a_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review of #4299: only the Anthropic handler seeded its CompressionCache
+    from a restored tracker. The OpenAI token path froze nothing, recompressed
+    the tool result under the new query, and with no provider-confirmed floor
+    the overlay declined the larger previous form, so the prefix changed."""
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    monkeypatch.setenv(PREFIX_STATE_FILE_ENV, str(tmp_path / "prefix-state.json"))
+    reset_compression_store()
+
+    (previous,) = _drive_openai_chat([_chat_turns(1)])
+    (current,) = _drive_openai_chat([_chat_turns(2)])
+
+    assert previous[2]["content"] != _chat_turns(1)[2]["content"], "nothing was compressed"
+    assert current[: len(previous)] == previous
+
+
 def test_read_maturation_state_survives_a_restart(tmp_path: Path) -> None:
     """Matured Reads stay booked once: without this a restart books their
     removal again on every later request of the conversation."""
@@ -313,3 +529,26 @@ def test_read_maturation_state_survives_a_restart(tmp_path: Path) -> None:
     assert adopted._matured == manager._matured
     assert adopted._booked == manager._booked
     assert adopted._replay_token_deltas == manager._replay_token_deltas
+
+
+def test_compress_sidecar_session_replays_its_prefix_after_a_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same seed on the session-aware /v1/compress path (sidecar gateways),
+    which replays with the size bound alone (no provider-confirmed floor)."""
+    from tests.test_compress_session_mode import _compress, _make_client
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    monkeypatch.setenv(PREFIX_STATE_FILE_ENV, str(tmp_path / "prefix-state.json"))
+    reset_compression_store()
+    forwarded = []
+    for history in (_chat_turns(1), _chat_turns(2)):  # one proxy each: a restart between
+        with _make_client() as client:
+            client.app.state.proxy._no_ccr_pipeline = lambda: SimpleNamespace(
+                apply=_relevance_pipeline
+            )
+            forwarded.append(_compress(client, history, session_id="conv-r")["messages"])
+    previous, current = forwarded
+
+    assert previous[2]["content"] != _chat_turns(1)[2]["content"], "nothing was compressed"
+    assert current[: len(previous)] == previous

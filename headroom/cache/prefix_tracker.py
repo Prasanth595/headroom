@@ -16,12 +16,14 @@ pipeline skips them entirely.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import itertools
 import json
 import logging
 import os
+import re
 import time
 from collections import OrderedDict, deque
 from contextvars import ContextVar
@@ -79,6 +81,9 @@ _PREFIX_STATE_VERSION = 1
 # Newest trackers first; whatever does not fit starts cold, as all did before.
 _PREFIX_STATE_MAX_TRACKERS = 256
 _PREFIX_STATE_MAX_BYTES = 64 * 1024 * 1024
+# Any CCR reference in saved messages: ``hash=<hex>`` markers (Retrieve
+# more/original, compressed-item counts) and SmartCrusher's ``<<ccr:<hex>``.
+_CCR_HASH_RE = re.compile(r"(?:hash=|<<ccr:)([0-9a-f]{12,24})")
 
 
 def prefix_state_file() -> str | None:
@@ -1649,6 +1654,23 @@ def _decode_turn_state(table: list[Any], state: list[Any]) -> tuple[Any, ...]:
     )
 
 
+def seed_restored_compression_cache(tracker: Any, comp_cache: Any) -> None:
+    """Seed a token-mode CompressionCache on a tracker's first request after
+    :meth:`SessionTrackerStore.load_state`.
+
+    The new process has no cache entries behind the restored prefix, so the
+    freeze computed from that cache freezes nothing: the pipeline recompresses
+    (and read maturation rewrites) messages the provider cached, and beyond the
+    provider-confirmed floor the overlay declines a larger replay. Seeding with
+    what was forwarded gives the freeze the pre-restart count.
+    """
+    if getattr(tracker, "restored_from_disk", False):
+        tracker.restored_from_disk = False
+        comp_cache.update_from_result(
+            tracker.get_last_original_messages(), tracker.get_last_forwarded_messages()
+        )
+
+
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
@@ -2057,9 +2079,12 @@ class SessionTrackerStore:
         from the prefix the provider cached, and the cache is re-written from
         the first changed message. Newest trackers first, capped at
         ``_PREFIX_STATE_MAX_TRACKERS`` and ``_PREFIX_STATE_MAX_BYTES``; a
-        tracker whose messages are not JSON is skipped. Never raises; returns
-        the number of trackers written.
+        tracker whose messages are not JSON is skipped. Each tracker carries
+        the CCR entries its messages reference, so its replayed markers still
+        resolve when the CCR backend does not survive the restart (memory).
+        Never raises; returns the number of trackers written.
         """
+        from headroom.cache.compression_store import get_compression_store
         from headroom.fsutil import write_text
         from headroom.paths import persistence_allowed
 
@@ -2072,23 +2097,33 @@ class SessionTrackerStore:
             reverse=True,
         )
         entries: list[str] = []
+        ccr: dict[str, str] = {}
         size = 0
         for key, tracker in live[:_PREFIX_STATE_MAX_TRACKERS]:
             try:
                 entry = self._encode_tracker(key, tracker, sessions.get(key))
-            except (TypeError, ValueError):
+                refs = [h for h in dict.fromkeys(_CCR_HASH_RE.findall(entry)) if h not in ccr]
+                records = get_compression_store().export_entries(refs) if refs else []
+                payloads = {r["hash"]: json.dumps(r) for r in records}
+            except Exception:  # an unsaveable tracker starts cold, as all did before
                 continue
-            if size + len(entry) > _PREFIX_STATE_MAX_BYTES:
+            grow = len(entry) + sum(len(p) + 1 for p in payloads.values())
+            if size + grow > _PREFIX_STATE_MAX_BYTES:
                 continue
-            size += len(entry) + 1
+            size += grow + 1
             entries.append(entry)
+            ccr.update(payloads)
         try:
             target = Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
-            # write_text keeps an existing file's mode; a fresh one is 0600.
-            target.unlink(missing_ok=True)
+            # write_text keeps the target's mode, so tighten it in place rather
+            # than unlinking: a failed write must leave the last snapshot.
+            with contextlib.suppress(FileNotFoundError):
+                target.chmod(0o600)
             write_text(
-                target, f'{{"version":{_PREFIX_STATE_VERSION},"trackers":[{",".join(entries)}]}}'
+                target,
+                f'{{"version":{_PREFIX_STATE_VERSION},"trackers":[{",".join(entries)}],'
+                f'"ccr":[{",".join(ccr.values())}]}}',
             )
         except OSError as exc:
             logger.warning("SessionTrackerStore: prefix state not saved to %s: %s", path, exc)
@@ -2147,6 +2182,11 @@ class SessionTrackerStore:
         lost. A missing file is normal; an unreadable or invalid one is logged
         and leaves the store empty. Never raises; returns trackers restored.
         """
+        from headroom.paths import persistence_allowed
+
+        # Loading deletes the file, so stateless mode leaves it for a later run.
+        if not persistence_allowed("prefix-cache tracker state"):
+            return 0
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -2175,8 +2215,11 @@ class SessionTrackerStore:
 
     def _decode_state(self, data: Any) -> int:
         """Validate the whole file first, then install it; a bad file installs nothing."""
+        from headroom.cache.compression_store import CompressionEntry, get_compression_store
+
         if data.get("version") != _PREFIX_STATE_VERSION:
             raise ValueError(f"unsupported version {data.get('version')!r}")
+        ccr = [CompressionEntry(**record) for record in data["ccr"]]
         trackers: dict[str, PrefixCacheTracker] = {}
         families: dict[str, OrderedDict[str, list[Any]]] = {}
         affinities: dict[str, str | None] = {}
@@ -2219,6 +2262,11 @@ class SessionTrackerStore:
                 families.setdefault(str(meta["session"]), OrderedDict())[key] = history[0][0]
                 affinity = meta["affinity"]
                 affinities[key] = None if affinity is None else str(affinity)
+
+        if ccr and trackers:
+            # First, so a marker a restored tracker replays resolves from its
+            # first request; a failure here still installs no tracker.
+            get_compression_store().import_entries(ccr)
 
         # New turns and lineages must not reuse a restored id.
         turns = [t for h in histories.values() for _, t in h]
