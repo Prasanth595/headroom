@@ -2029,6 +2029,15 @@ class AnthropicHandlerMixin:
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
+                        if getattr(prefix_tracker, "restored_from_disk", False):
+                            # Resumed after a restart (HEADROOM_PREFIX_STATE_FILE):
+                            # seed the empty cache with what was forwarded, or the
+                            # clamp below freezes nothing and read maturation
+                            # rewrites Reads inside the cached prefix.
+                            prefix_tracker.restored_from_disk = False
+                            comp_cache.update_from_result(
+                                previous_original_messages, previous_forwarded_messages
+                            )
 
                         # Freeze + stable marking + Zone-1 swap now live in the
                         # shared session engine (PROXY policy: clamp by BOTH the
@@ -2609,6 +2618,10 @@ class AnthropicHandlerMixin:
                             compression_store=get_compression_store(),
                         )
                         prefix_tracker.read_maturation_manager = maturation_mgr
+                        state = getattr(prefix_tracker, "restored_maturation_state", None)
+                        if state is not None:
+                            prefix_tracker.restored_maturation_state = None
+                            maturation_mgr.restore_state(state)
                     _maturation_mgr = maturation_mgr
                     maturation = maturation_mgr.apply(
                         optimized_messages,
