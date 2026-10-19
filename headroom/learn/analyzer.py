@@ -397,6 +397,12 @@ def _build_digest(
     # Budget tracking — stop adding events when we approach the limit
     # Rough estimate: 4 chars per token
     char_budget = max_tokens * 4
+    # Every line costs its length plus the newline joining it, and goes in only
+    # if it leaves this room for the truncation markers that can follow it (an
+    # events line, a blank, a sessions line), so the digest stays inside
+    # char_budget. Only a prior-patterns section that leaves no such room on
+    # its own (never cut, see below) can push it past.
+    room = char_budget - 100
 
     # Prior learned patterns (if any) — gives the LLM the current baseline so
     # it can produce complete updated sections instead of condensed deltas.
@@ -411,24 +417,19 @@ def _build_digest(
     # patterns leave short. Rendered whole, every loop with every index, the
     # section alone outgrew the digest on a machine with years of Codex
     # sessions, which learn scans as one project.
-    pre_event_chars = sum(len(ln) for ln in lines) + len(prior_section)
+    pre_event_chars = sum(len(ln) + 1 for ln in lines) + len(prior_section) + 2
     loop_section = format_loops_for_digest(
-        loops, max_chars=min(char_budget // 4, char_budget - pre_event_chars)
+        loops, max_chars=min(char_budget // 4, room - pre_event_chars)
     )
     if loop_section:
         lines.append(loop_section)
     if prior_section:
         lines.append(prior_section)
 
-    chars_used = sum(len(ln) for ln in lines)
+    chars_used = sum(len(ln) + 1 for ln in lines)
+    full = False
 
     for session in sessions:
-        if chars_used > char_budget:
-            lines.append(
-                f"... (remaining {len(sessions) - sessions.index(session)} sessions truncated)"
-            )
-            break
-
         session_header = (
             f"=== Session {session.session_id[:12]} "
             f"({len(session.tool_calls)} calls, {session.failure_count} failures"
@@ -436,29 +437,38 @@ def _build_digest(
         if session.total_input_tokens:
             session_header += f", {session.total_input_tokens:,} input tokens"
         session_header += ") ==="
+        if full or chars_used + len(session_header) + 1 > room:
+            lines.append(
+                f"... (remaining {len(sessions) - sessions.index(session)} sessions truncated)"
+            )
+            break
         lines.append(session_header)
-        chars_used += len(session_header)
+        chars_used += len(session_header) + 1
 
         # Use events if available (richer context), fall back to tool_calls
         if session.events:
             for event in session.events:
-                if chars_used > char_budget:
-                    lines.append("  ... (remaining events truncated)")
-                    break
                 event_line = _format_event(event)
-                if event_line:
-                    lines.append(event_line)
-                    chars_used += len(event_line)
+                if not event_line:
+                    continue
+                if chars_used + len(event_line) + 1 > room:
+                    lines.append("  ... (remaining events truncated)")
+                    full = True
+                    break
+                lines.append(event_line)
+                chars_used += len(event_line) + 1
         else:
             for tc in session.tool_calls:
-                if chars_used > char_budget:
-                    lines.append("  ... (remaining calls truncated)")
-                    break
                 tc_line = _format_tool_call(tc)
+                if chars_used + len(tc_line) + 1 > room:
+                    lines.append("  ... (remaining calls truncated)")
+                    full = True
+                    break
                 lines.append(tc_line)
-                chars_used += len(tc_line)
+                chars_used += len(tc_line) + 1
 
         lines.append("")
+        chars_used += 1
 
     return "\n".join(lines)
 

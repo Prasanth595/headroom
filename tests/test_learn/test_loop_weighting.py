@@ -38,6 +38,7 @@ from headroom.learn.models import (
     Recommendation,
     RecommendationTarget,
     SessionData,
+    SessionEvent,
     ToolCall,
 )
 
@@ -200,6 +201,43 @@ class TestDigestSurfacesLoops:
         assert bullets.splitlines()[-1] in digest
         assert "~1,000,000 tokens wasted" in digest
         assert len(digest) <= max_tokens * 4
+
+    @pytest.mark.parametrize("with_loops", [False, True], ids=["no-loops", "loops"])
+    @pytest.mark.parametrize("with_events", [False, True], ids=["tool-calls", "events"])
+    @pytest.mark.parametrize("max_tokens", [80_000, 10_000])
+    def test_whole_digest_stays_inside_the_budget(self, max_tokens, with_events, with_loops):
+        # Far more session text than the budget: every line and its newline
+        # counts, and none goes in that would leave no room for the markers.
+        sessions = []
+        for s in range(5):
+            calls = [
+                ToolCall(
+                    name="Bash",
+                    tool_call_id=f"{s}-{i}",
+                    input_data={"command": f"run {i}"},
+                    output="e" * 300,
+                    is_error=True,
+                    msg_index=i,
+                )
+                for i in range(3000)
+            ]
+            events = (
+                [SessionEvent(type="tool_call", msg_index=c.msg_index, tool_call=c) for c in calls]
+                if with_events
+                else []
+            )
+            sessions.append(SessionData(session_id=f"s{s}", tool_calls=calls, events=events))
+        loops = (
+            [
+                LoopPattern("Grep", "s", "x" * 2000, 300, False, 1_000_000 - i, list(range(300)))
+                for i in range(2000)
+            ]
+            if with_loops
+            else []
+        )
+        digest = _build_digest(_project(), sessions, loops=loops, max_tokens=max_tokens)
+        assert len(digest) <= max_tokens * 4
+        assert "remaining" in digest and "sessions truncated" in digest
 
 
 # =============================================================================
