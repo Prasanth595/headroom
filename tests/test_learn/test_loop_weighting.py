@@ -239,6 +239,32 @@ class TestDigestSurfacesLoops:
         assert len(digest) <= max_tokens * 4
         assert "remaining" in digest and "sessions truncated" in digest
 
+    @pytest.mark.parametrize("with_events", [False, True], ids=["tool-calls", "events"])
+    @pytest.mark.parametrize("max_tokens", [80_000, 10_000])
+    def test_many_tiny_sessions_stay_inside_the_budget(self, max_tokens, with_events):
+        # Thousands of kept sessions, each closed by a blank line whose newline
+        # counts too; the marker reserve alone would absorb only ~100 of them.
+        sessions = []
+        for s in range(20_000):
+            call = ToolCall(
+                name="Bash",
+                tool_call_id=str(s),
+                input_data={"command": "ls"},
+                output="ok",
+                is_error=False,
+                msg_index=0,
+            )
+            events = [SessionEvent(type="tool_call", msg_index=0, tool_call=call)]
+            sessions.append(
+                SessionData(
+                    session_id=f"s{s}", tool_calls=[call], events=events if with_events else []
+                )
+            )
+        digest = _build_digest(_project(), sessions, loops=[], max_tokens=max_tokens)
+        assert len(digest) <= max_tokens * 4
+        assert digest.count("=== Session ") > 500
+        assert "sessions truncated" in digest
+
 
 # =============================================================================
 # apply_loop_weighting
