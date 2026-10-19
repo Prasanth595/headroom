@@ -333,13 +333,11 @@ class ImageCompressor:
         # Resize
         resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-        # Convert to RGB if needed (for JPEG)
-        if resized.mode in ("RGBA", "P"):
-            resized = resized.convert("RGB")
-
         # Save as JPEG for best compression
+        from .tile_optimizer import _jpeg_ready
+
         buf = io.BytesIO()
-        resized.save(buf, format="JPEG", quality=quality, optimize=True)
+        _jpeg_ready(resized).save(buf, format="JPEG", quality=quality, optimize=True)
         return buf.getvalue(), "image/jpeg"
 
     def _estimate_tokens(self, image_data: bytes, detail: str = "high") -> int:
