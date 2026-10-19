@@ -72,7 +72,23 @@ def test_argument_is_used_when_config_has_no_store_url(tmp_path: Path, temp_dir:
     client = _client(store_url=f"sqlite:///{from_argument}", config=config)
 
     assert _storage_path(client) == from_argument.resolve()
-    assert config.store_url == f"sqlite:///{from_argument}"
+    assert config.store_url is None
+
+
+def test_shared_config_does_not_leak_one_clients_url_into_another(
+    tmp_path: Path, temp_dir: Path
+) -> None:
+    """One config object reused for two clients, each with its own database."""
+    shared = HeadroomConfig()
+    a_db = tmp_path / "a.db"
+    b_db = tmp_path / "b.db"
+
+    client_a = _client(store_url=f"sqlite:///{a_db}", config=shared)
+    client_b = _client(store_url=f"sqlite:///{b_db}", config=shared)
+
+    assert _storage_path(client_a) == a_db.resolve()
+    assert _storage_path(client_b) == b_db.resolve()
+    assert shared.store_url is None
 
 
 def test_default_config_stores_in_temp_dir_not_cwd(
