@@ -71,3 +71,23 @@ def test_wrap_hermes_prepare_only_exits_cleanly(
 
     assert result.exit_code == 0, result.output
     launch_tool.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("hermes_args", "warned"),
+    [((), True), (("--provider", "openrouter"), True), (("--provider", "anthropic"), False)],
+)
+def test_wrap_hermes_warns_when_provider_is_not_routed(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    hermes_args: tuple[str, ...],
+    warned: bool,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with patch.object(wrap_mod.shutil, "which", return_value="hermes"):
+        with patch.object(wrap_mod, "_launch_tool"):
+            result = runner.invoke(main, ["wrap", "hermes", "--", *hermes_args])
+
+    assert result.exit_code == 0, result.output
+    assert ("skip Headroom" in result.output) is warned

@@ -42,6 +42,35 @@ def build_launch_env(
     ]
 
 
+# Hermes honors OPENAI_BASE_URL / ANTHROPIC_BASE_URL only for these providers.
+# Its default (openrouter) and others such as nous call their own endpoints.
+_ROUTED_PROVIDERS = frozenset({"anthropic", "openai", "custom"})
+
+
+def unrouted_provider_warning(hermes_args: tuple[str, ...] | list[str]) -> str | None:
+    """Return a warning unless ``--provider`` names a provider Headroom can route.
+
+    ponytail: only reads ``--provider`` from the CLI args, not
+    ~/.hermes/config.yaml, so a config-only anthropic/openai setup still sees
+    the note. Parse the config if that noise matters.
+    """
+    args = list(hermes_args)
+    provider = None
+    for index, arg in enumerate(args):
+        if arg == "--provider" and index + 1 < len(args):
+            provider = args[index + 1]
+        elif arg.startswith("--provider="):
+            provider = arg.split("=", 1)[1]
+    if provider and provider.lower() in _ROUTED_PROVIDERS:
+        return None
+    return (
+        "Note: Headroom only routes Hermes traffic for the anthropic and openai "
+        "providers. Hermes's default provider (openrouter) and others such as "
+        "nous call their own endpoints and skip Headroom. "
+        "Use e.g. `headroom wrap hermes -- --provider anthropic`."
+    )
+
+
 def is_scoped_coding_agent_path(path: str) -> bool:
     """Return whether *path* is a Hermes scoped coding-agent endpoint."""
     return (path.startswith("/api/codex-proxy/") and path.endswith(_CODEX_RESPONSES_SUFFIX)) or (
