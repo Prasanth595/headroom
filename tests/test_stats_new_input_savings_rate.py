@@ -218,3 +218,70 @@ def test_inferred_openai_write_counts_as_new_input_once(tmp_path, monkeypatch):
     assert openai_row["hit_rate"] == 50.0
     new_input = totals["cache_write_tokens"] + totals["uncached_input_tokens"]
     assert new_input == totals["new_input_tokens"]
+
+
+def test_inferred_openai_write_carries_no_write_premium(tmp_path, monkeypatch):
+    """The OpenAI row prices its write premium from the cost tracker's model.
+    Where the catalog gives that model a write rate above input (gpt-5.6
+    publishes 1.25x), an inferred write counted as a write was charged the
+    premium on tokens OpenAI billed as plain input."""
+    import litellm
+
+    from headroom.pricing.counterfactual import resolve_rates
+    from headroom.proxy.outcome import RequestOutcome
+
+    ledger_path = tmp_path / "savings_events.jsonl"
+    monkeypatch.setattr(savings_ledger, "_resolve_path", lambda path=None: ledger_path)
+    # A real catalog id with known rates, so the live catalog cannot move them.
+    model = "gpt-4o"
+    monkeypatch.setitem(
+        litellm.model_cost,
+        model,
+        {
+            "input_cost_per_token": 4e-6,
+            "output_cost_per_token": 3.2e-5,
+            "cache_read_input_token_cost": 4e-7,
+            "cache_creation_input_token_cost": 5e-6,
+            "litellm_provider": "openai",
+            "mode": "chat",
+        },
+    )
+    resolve_rates.cache_clear()
+    try:
+        with _make_client(tmp_path, monkeypatch) as client:
+            proxy = client.app.state.proxy
+            # The Chat Completions handler's outcome: no reported write, so the
+            # write is inferred as input - cached. Feeds metrics AND the cost
+            # tracker, which supplies the price build_prefix_cache_stats uses.
+            asyncio.run(
+                proxy._record_request_outcome(
+                    RequestOutcome(
+                        request_id="req_inferred_write",
+                        provider="openai",
+                        model=model,
+                        original_tokens=2_000,
+                        optimized_tokens=2_000,
+                        provider_input_tokens=2_000,
+                        output_tokens=10,
+                        tokens_saved=0,
+                        attempted_input_tokens=2_000,
+                        cache_read_tokens=1_000,
+                        cache_write_tokens=1_000,
+                        uncached_input_tokens=1_000,
+                        cache_inferred=True,
+                    )
+                )
+            )
+            openai_row = client.get("/stats").json()["prefix_cache"]["by_provider"]["openai"]
+    finally:
+        resolve_rates.cache_clear()
+
+    # The catalog write rate is in force, so a write would be charged 25%.
+    assert openai_row["cache_pricing_source"] == "catalog"
+    assert openai_row["write_premium"] == "25%"
+    # 1,000 reads x $4/M x 90% read discount.
+    assert openai_row["savings_usd"] == 0.0036
+    # Counted as a write: 1,000 x $4/M x 25% = $0.001 premium, net $0.0026.
+    assert openai_row["write_premium_usd"] == 0.0
+    assert openai_row["net_savings_usd"] == 0.0036
+    assert openai_row["cache_write_tokens"] == 0
