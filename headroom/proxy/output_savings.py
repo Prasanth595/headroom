@@ -41,6 +41,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -392,6 +394,30 @@ def _measured_supersedes(measured: SavingsEstimate, labelled_requests: int) -> b
     return _measured_covers(measured, labelled_requests)
 
 
+@contextmanager
+def ledger_lock(path: Any) -> Iterator[None]:
+    """Serialize read-modify-write of the ledger file across processes.
+
+    The lock lives in a sidecar file because ``save`` replaces the ledger's
+    inode. Unix-only, like the other flock users; elsewhere it is a no-op.
+    """
+    from pathlib import Path
+
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    lock_path = Path(str(path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 @dataclass
 class SavingsLedger:
     """Accumulates shaped (treatment) and unshaped (control) observations and
@@ -671,6 +697,14 @@ class SavingsLedger:
             logger.warning("output-savings ledger %s unreadable, starting empty: %s", p, exc)
             return cls()
 
+    @classmethod
+    def store_baseline(cls, path: Any, baseline: BaselineModel) -> None:
+        """Replace the on-disk baseline, keeping the live arms already there."""
+        with ledger_lock(path):
+            ledger = cls.load(path)
+            ledger.baseline = baseline
+            ledger.save(path)
+
 
 # --------------------------------------------------------------------------
 # Live recording — rides the existing ``transforms_applied`` label channel so
@@ -701,7 +735,7 @@ class SavingsRecorder:
             # Persist the drop now. With the shaper off nothing ever records,
             # so waiting for a periodic flush would leave the legacy file on
             # disk indefinitely.
-            self._save_unless_stateless()
+            self._migrate_legacy()
 
     def record_from_labels(self, labels: Any, output_tokens: int) -> bool:
         """Record one outcome given its transforms_applied labels. Returns True
@@ -800,13 +834,18 @@ class SavingsRecorder:
         if disk.baseline.to_dict() != self._ledger.baseline.to_dict():
             self._ledger.baseline = disk.baseline
 
-    def _save_unless_stateless(self) -> None:
+    def _migrate_legacy(self) -> None:
         from ..paths import process_is_stateless
 
         if process_is_stateless():
             return
         try:
-            self._ledger.save(self._path)
+            with ledger_lock(self._path):
+                # Re-read under the lock: another writer may have replaced the
+                # file since the first load, and its copy is the newer one.
+                self._ledger = SavingsLedger.load(self._path, warn_legacy=False)
+                if self._ledger.dropped_legacy_arms:
+                    self._ledger.save(self._path)
         except OSError:
             pass
 
@@ -818,8 +857,9 @@ class SavingsRecorder:
             self._since_flush = 0
             return
         try:
-            self._reload_baseline_locked()
-            self._ledger.save(self._path)
+            with ledger_lock(self._path):
+                self._reload_baseline_locked()
+                self._ledger.save(self._path)
             self._since_flush = 0
         except OSError:
             pass
