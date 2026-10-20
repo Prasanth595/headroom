@@ -31,3 +31,18 @@ def test_parse_sse_events_preserves_split_utf8_tail() -> None:
 def test_parse_sse_events_raises_on_complete_invalid_utf8_event() -> None:
     with pytest.raises(UnicodeDecodeError):
         parse_sse_events_from_byte_buffer(bytearray(b"data: \xff\n\n"))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"data: one\n\r\ndata: two\n\n", b"data: one\r\rdata: two\r\r"],
+)
+def test_parse_sse_events_accepts_mixed_and_cr_only_line_endings(raw: bytes) -> None:
+    buf = bytearray(raw)
+
+    assert parse_sse_events_from_byte_buffer(buf) == [(None, "one"), (None, "two")]
+    assert bytes(buf) == b""
+
+
+def test_find_sse_event_terminator_prefers_full_crlf_blank_line() -> None:
+    assert find_sse_event_terminator(bytearray(b"data: one\r\n\r\nrest")) == (9, 4)
