@@ -60,6 +60,28 @@ function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException)?.code;
 }
 
+/**
+ * Whether something other than a directory -- a regular file, say -- sits on
+ * `dir`'s path, so that nothing beneath it can exist. POSIX reports such a
+ * path as ENOTDIR, but Windows reports ENOENT, which reads exactly like an
+ * absent marker; the nearest ancestor that exists tells the two apart.
+ */
+async function isBlockedPath(dir: string): Promise<boolean> {
+  for (let current = dir; ; current = dirname(current)) {
+    try {
+      return !(await stat(current)).isDirectory();
+    } catch (error) {
+      const code = errorCode(error);
+      if (code === "ENOTDIR") {
+        return true;
+      }
+      if (code !== "ENOENT" || dirname(current) === current) {
+        throw error;
+      }
+    }
+  }
+}
+
 /** Identifies one version of a legacy log file: any rewrite changes at least one of these. */
 type LegacyLogVersion = { size: number; mtimeMs: number; ino: number };
 
@@ -109,15 +131,19 @@ export class DurableAdvancementKeyStore {
     );
   }
 
-  /** Whether a marker file -- not a directory or anything else -- exists at `marker`. */
+  /**
+   * Whether a marker file -- not a directory or anything else -- exists at
+   * `marker`. Storage that can't hold one (a file where a directory belongs)
+   * is an error, never an absent marker.
+   */
   private async isMarker(marker: string): Promise<boolean> {
     try {
       return (await lstat(marker)).isFile();
     } catch (error) {
-      if (errorCode(error) === "ENOENT") {
+      if (errorCode(error) === "ENOENT" && !(await isBlockedPath(dirname(marker)).catch(() => true))) {
         return false;
       }
-      throw error;
+      throw this.storageError(error);
     }
   }
 
